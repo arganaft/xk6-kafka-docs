@@ -164,9 +164,9 @@ const reader = new Reader({ brokers: ["localhost:9092"], groupID: "example-group
 | maxWait | time.Duration | Максимальное время ожидания сообщений | "5s" или 5 * SECOND |
 | startOffset | int | Начальный офсет | START_OFFSETS_LAST_OFFSET |
 
-Параметр Тип Описание Пример/Пояснение Источник brokers string Адреса Kafka-брокеров. ["localhost:9092"] topic string Топик (для чтения без группы). "my-topic" groupID string Идентификатор группы потребителей. "example-group" groupTopics string Список топиков для группы. ["topic-1", "topic-2"] maxWait time.Duration Максимальное время ожидания сообщений. "5s" или 5 * SECOND startOffset int Начальный офсет. START_OFFSETS_LAST_OFFSET
 
-V. Сериализация, Десериализация и Схемы Данных 5.1. Поддержка Форматов и Роль SchemaRegistry xk6-kafka поддерживает разнообразные форматы для производства и потребления сообщений, что позволяет имитировать реальные рабочие нагрузки :
+V. Сериализация, Десериализация и Схемы Данных
+5.1. Поддержка Форматов и Роль SchemaRegistry xk6-kafka поддерживает разнообразные форматы для производства и потребления сообщений, что позволяет имитировать реальные рабочие нагрузки :
 
 String
 
