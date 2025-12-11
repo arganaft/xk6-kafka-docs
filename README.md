@@ -155,6 +155,14 @@ const reader = new Reader({ brokers: ["localhost:9092"], groupID: "example-group
 4.3. Управление Офсетами Reader позволяет контролировать начальную точку чтения с помощью параметра startOffset. Ключевая константа START_OFFSETS_LAST_OFFSET позволяет начать чтение с самого последнего записанного офсета, игнорируя исторические данные.
 
 Ключевые Параметры Конфигурации ReaderConfig
+| Параметр | Тип | Описание | Пример/Пояснение |
+|-------------|-------------|-------------|-------------|
+| brokers | string | Адреса Kafka-брокеров | ["localhost:9092"] |
+| topic | string | Топик (для чтения без группы) | "my-topic" |
+| groupID | string | Идентификатор группы потребителей | "example-group" |
+| groupTopics | string | Список топиков для группы | ["topic-1", "topic-2"] |
+| maxWait | time.Duration | Максимальное время ожидания сообщений | "5s" или 5 * SECOND |
+| startOffset | int | Начальный офсет | START_OFFSETS_LAST_OFFSET |
 
 Параметр Тип Описание Пример/Пояснение Источник brokers string Адреса Kafka-брокеров. ["localhost:9092"] topic string Топик (для чтения без группы). "my-topic" groupID string Идентификатор группы потребителей. "example-group" groupTopics string Список топиков для группы. ["topic-1", "topic-2"] maxWait time.Duration Максимальное время ожидания сообщений. "5s" или 5 * SECOND startOffset int Начальный офсет. START_OFFSETS_LAST_OFFSET
 
