@@ -104,7 +104,9 @@ JavaScript const writer = new Writer({ brokers: ["localhost:9092"], topic: "my-t
 ```JavaScript
  import { SECOND, Writer } from "k6/x/kafka";
 const writer = new Writer({
- //... BatchTimeout: 5 * SECOND, ReadTimeout: 1 * SECOND, WriteTimeout: 1 * SECOND, });
+ BatchTimeout: 5 * SECOND,
+ ReadTimeout: 1 * SECOND,
+ WriteTimeout: 1 * SECOND, });
 ```
  3.4. Управление Большими Объемами Данных: Сжатие Для эффективной симуляции высокой пропускной способности при ограничении пропускной способности сети необходимо использовать сжатие сообщений. xk6-kafka поддерживает следующие алгоритмы сжатия :
 
