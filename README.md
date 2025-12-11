@@ -18,11 +18,19 @@ SchemaRegistry (Реестр Схем): Используется для сери
 
 Процесс сборки выполняется с помощью утилиты xk6 и включает в себя указание пути к расширению:
 
-Bash xk6 build --with github.com/mostafa/xk6-kafka II. Жизненный Цикл Теста k6 и Надежное Управление Ресурсами 2.1. Инициализация Объектов (Контекст init) В соответствии с методологией k6, долгоживущие объекты, которые используются всеми виртуальными пользователями (VU) на протяжении всего теста, должны быть созданы в контексте init. Это позволяет избежать накладных расходов на их создание во время выполнения нагрузки.
+```Bash
+ xk6 build --with github.com/mostafa/xk6-kafka
+```
+
+II. Жизненный Цикл Теста k6 и Надежное Управление Ресурсами
+2.1. Инициализация Объектов (Контекст init) В соответствии с методологией k6, долгоживущие объекты, которые используются всеми виртуальными пользователями (VU) на протяжении всего теста, должны быть созданы в контексте init. Это позволяет избежать накладных расходов на их создание во время выполнения нагрузки.
 
 Для импорта рекомендуется использовать явное указание необходимых классов и констант для повышения читаемости сценария:
 
-JavaScript import { sleep } from "k6"; import { Writer, Reader, Connection, SchemaRegistry, SCHEMA_TYPE_STRING } from "k6/x/kafka";
+```JavaScript
+ import { sleep } from "k6";
+ import { Writer, Reader, Connection, SchemaRegistry, SCHEMA_TYPE_STRING } from "k6/x/kafka";
+```
 
 // Инициализация объектов в контексте 'init' const writer = new Writer({ brokers: ["localhost:9092"], topic: "my-topic", }); const reader = new Reader({ brokers: ["localhost:9092"], topic: "my-topic", }); const connection = new Connection({ address: "localhost:9092", }); const schemaRegistry = new SchemaRegistry();
 
