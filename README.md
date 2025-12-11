@@ -254,29 +254,45 @@ kafka_reader_timeouts_count: Общее количество таймаутов,
 Максимально допустимый лаг: Гарантия, что система не отстает более чем на 1000 сообщений:
 
 ```JavaScript
- thresholds: { 'kafka_reader_lag': ['max < 1000'], } Задержка записи: Обеспечение того, что 95-й перцентиль времени записи батча не превышает 300 миллисекунд:
+ thresholds: { 'kafka_reader_lag': ['max < 1000'], }
+ // Задержка записи: Обеспечение того, что 95-й перцентиль времени записи батча не превышает 300 миллисекунд:
+ thresholds: { 'kafka_writer_batch_seconds': ['p(95) < 0.3'], }
+ // Надежность: Требование нулевой частоты ошибок записи:
+ thresholds: { 'kafka_writer_error_count': ['count == 0'], }
 ```
 
-```JavaScript
- thresholds: { 'kafka_writer_batch_seconds': ['p(95) < 0.3'], } Надежность: Требование нулевой частоты ошибок записи:
-```
+ IX. Комплексные Примеры Сценариев k6 Ниже представлена структурная схема полного сценария нагрузочного тестирования, объединяющего API производителя, потребителя и административные функции:
 
 ```JavaScript
- thresholds: { 'kafka_writer_error_count': ['count == 0'], } IX. Комплексные Примеры Сценариев k6 Ниже представлена структурная схема полного сценария нагрузочного тестирования, объединяющего API производителя, потребителя и административные функции:
-```
-
-```JavaScript
- // 1. Импорт необходимых компонентов import { sleep } from "k6";
+ // 1. Импорт необходимых компонентов
+ import { sleep } from "k6";
  import { Writer, Reader, Connection, SECOND, START_OFFSETS_LAST_OFFSET } from "k6/x/kafka";
 
-// 2. Инициализация в контексте 'init' const KAFKA_BROKERS = ["localhost:9092"]; const TOPIC_NAME = "my-load-topic";
+// 2. Инициализация в контексте
+ 'init'
+ const KAFKA_BROKERS = ["localhost:9092"];
+ const TOPIC_NAME = "my-load-topic";
 
-const writer = new Writer({ brokers: KAFKA_BROKERS, topic: TOPIC_NAME, BatchTimeout: 1 * SECOND, RequiredAcks: 1, // Leader acknowledgement });
+const writer = new Writer({
+ brokers: KAFKA_BROKERS,
+ topic: TOPIC_NAME,
+ BatchTimeout: 1 * SECOND,
+ RequiredAcks: 1, // Leader acknowledgement });
 
-const reader = new Reader({ brokers: KAFKA_BROKERS, groupID: "test-consumer-group", groupTopics:, startOffset: START_OFFSETS_LAST_OFFSET, maxWait: 500 * SECOND / 1000, // 500ms });
+const reader = new Reader({
+ brokers: KAFKA_BROKERS,
+ groupID: "test-consumer-group",
+ groupTopics:,
+ startOffset: START_OFFSETS_LAST_OFFSET
+ maxWait: 500 * SECOND / 1000, // 500ms });
 
 const adminConnection = new Connection({ address: KAFKA_BROKERS, });
 
-// 3. Конфигурация k6 (опционально - установка порогов) export const options = { vus: 10, duration: '30s', thresholds: { 'kafka_writer_error_count': ['count == 0'], 'kafka_reader_lag': ['p(99) < 500'], // Лаг не должен превышать 500 }, };
+// 3. Конфигурация k6 (опционально - установка порогов)
+ export const options = {
+ vus: 10,
+ duration: '30s',
+ thresholds: { 'kafka_writer_error_count': ['count == 0'],
+ 'kafka_reader_lag': ['p(99) < 500'], // Лаг не должен превышать 500 }, };
 ```
 /
