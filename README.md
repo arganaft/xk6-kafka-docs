@@ -129,7 +129,8 @@ IV. API Потребителя (Reader) и Управление Группами
 ```JavaScript
  const reader = new Reader({
   brokers: ["localhost:9092"],
-  topic: "my-topic", maxWait: "5s", // Максимальное время ожидания сообщений
+  topic: "my-topic",
+  maxWait: "5s", // Максимальное время ожидания сообщений
  });
 ```
 
