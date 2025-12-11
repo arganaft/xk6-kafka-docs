@@ -46,14 +46,18 @@ A. Рекомендованный Метод: Использование setup()
  export function setup() {
  // Connection должен быть создан внутри setup() для правильного контекста
  const setupConnection = new Connection({ address: "localhost:9092", });
+// Создание топика
+ setupConnection.createTopic({ topic: "my-topic",
+                               numPartitions: 10, // Управление количеством партиций
+                               replicationFactor: 1, });
+// Верификация и ожидание распространения метаданных
+ const topics = setupConnection.listTopics();
+ if (!topics.includes("my-topic")) { throw new Error("Topic creation failed");
+ } setupConnection.close();
+
+// Критически важный шаг: ожидание распространения метаданных
+ Kafka sleep(2); }
 ```
-
-// Создание топика setupConnection.createTopic({ topic: "my-topic", numPartitions: 10, // Управление количеством партиций replicationFactor: 1, });
-
-// Верификация и ожидание распространения метаданных const topics = setupConnection.listTopics(); if (!topics.includes("my-topic")) { throw new Error("Topic creation failed"); } setupConnection.close();
-
-// Критически важный шаг: ожидание распространения метаданных Kafka sleep(2); }
-
 Применение функции sleep(2) после успешного создания топика является не просто произвольной задержкой, а необходимым шагом для обеспечения эвентуальной согласованности метаданных Kafka. Это гарантирует, что когда начнется фаза default (выполнение нагрузки), объекты Writer и Reader будут видеть корректную информацию о топике и его партициях, что предотвращает сбои при инициализации продюсеров.
 
 B. Конфигурация Создания Топика (TopicConfig) При создании топика можно указать желаемое количество партиций (numPartitions, по умолчанию 1) и коэффициент репликации (replicationFactor, по умолчанию 1).
