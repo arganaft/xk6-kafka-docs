@@ -1,3 +1,30 @@
+Есть приложение на java Spring boot, работающее в кластере kubernetes 
+И есть несколько физических серверов postgresql вне кластера kubernetes объединенные по архитектуре master-replica, запись только на мастер, а чтение распределяется по репликам.
+
+Понятно что ConfigMap  можно оформить таким образом:
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spring-app-config
+data:
+  # MASTER DataSource - для записи
+  spring.datasource.master.url: "jdbc:postgresql://db1.ru:5433,db2.ru:5433/mr?prepareThreshold=0&targetServerType=master&loadBalanceHosts=true&hostRecheckSeconds=5&connectTimeout=2&socketTimeout=30&tcpKeepAlive=true&currentSchema=murex"
+  spring.datasource.master.username: "app_user"
+  spring.datasource.master.password: "${DB_PASSWORD}"
+  # REPLICA DataSource - для чтения
+  spring.datasource.replica.url: "jdbc:postgresql://db1.ru:5433,db2.ru:5433/mr?prepareThreshold=0&targetServerType=preferSlave&loadBalanceHosts=true&hostRecheckSeconds=5&connectTimeout=2&socketTimeout=30&tcpKeepAlive=true&currentSchema=murex"
+  spring.datasource.replica.username: "app_user"
+  spring.datasource.replica.password: "${DB_PASSWORD}"
+  Но как реализовать ту часть которая находится в самом приложении?
+Есть вариант с AOP, но он мне не очень нравится. Можно ли реализовать так:
+DBManager.write()
+DBManager.read()
+Или WriteMeneger и ReadMeneger?
+Или предложи свое решение. И Вообще скажи какое самое правильное и общепринятое решение?
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 Использование параметров драйвера PostgreSQL (`targetServerType=master` и `targetServerType=preferSlave`) в URL — это отличное начало. Это снимает часть головной боли с балансировкой на уровне сети.
 
 Отвечая на твой вопрос о реализации в коде:
