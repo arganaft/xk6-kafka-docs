@@ -1,0 +1,1052 @@
+
+
+# Apache Calcite JSON SQL Processor для Spring Boot
+
+## Архитектура решения
+
+```
+Input JSON Stream → Calcite SQL Engine → Filtered/Grouped/Paginated JSON → WebSocket Clients
+```
+
+## 1. Зависимости (pom.xml)
+
+```xml
+<properties>
+    <java.version>21</java.version>
+    <spring-boot.version>3.5.5</spring-boot.version>
+    <calcite.version>1.38.0</calcite.version>
+</properties>
+
+<dependencies>
+    <!-- Spring Boot -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Apache Calcite -->
+    <dependency>
+        <groupId>org.apache.calcite</groupId>
+        <artifactId>calcite-core</artifactId>
+        <version>${calcite.version}</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.calcite</groupId>
+        <artifactId>calcite-linq4j</artifactId>
+        <version>${calcite.version}</version>
+    </dependency>
+
+    <!-- Jackson -->
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+## 2. Конфигурация приложения
+
+```yaml
+# application.yml
+spring:
+  threads:
+    virtual:
+      enabled: true
+
+app:
+  calcite:
+    default-schema: "stream"
+    max-rows: 10000
+    query-timeout-seconds: 30
+```
+
+## 3. Основные классы
+
+### 3.1. Модель запроса/ответа
+
+```java
+package com.example.calcite.model;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.*;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Запрос от клиента через WebSocket
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class QueryRequest {
+    /** SQL-запрос (SELECT ... FROM data WHERE ... GROUP BY ... ORDER BY ... LIMIT ... OFFSET ...) */
+    private String sql;
+    
+    /** Опциональный ID подписки для идентификации */
+    private String subscriptionId;
+}
+
+/**
+ * Ответ клиенту
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class QueryResponse {
+    private String subscriptionId;
+    private List<Map<String, Object>> rows;
+    private List<String> columns;
+    private int totalRows;
+    private Long executionTimeMs;
+    private String error;
+}
+
+/**
+ * Обёртка входного потока данных
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class StreamData {
+    private String tableName;
+    private List<Map<String, Object>> rows;
+}
+```
+
+### 3.2. Calcite Schema — адаптер JSON-данных в таблицы
+
+```java
+package com.example.calcite.engine;
+
+import org.apache.calcite.schema.Table;
+import org.apache.calcite.schema.impl.AbstractSchema;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Динамическая Calcite-схема, в которую можно добавлять/обновлять таблицы
+ * на основе входящих JSON-данных.
+ */
+public class JsonStreamSchema extends AbstractSchema {
+
+    private final ConcurrentHashMap<String, JsonTable> tables = new ConcurrentHashMap<>();
+
+    /**
+     * Обновить данные таблицы (вызывается при поступлении нового JSON)
+     */
+    public void updateTable(String tableName, List<Map<String, Object>> rows) {
+        tables.compute(tableName, (name, existing) -> {
+            if (existing != null) {
+                existing.updateData(rows);
+                return existing;
+            }
+            return new JsonTable(rows);
+        });
+    }
+
+    /**
+     * Добавить строки в существующую таблицу
+     */
+    public void appendToTable(String tableName, List<Map<String, Object>> rows) {
+        tables.compute(tableName, (name, existing) -> {
+            if (existing != null) {
+                existing.appendData(rows);
+                return existing;
+            }
+            return new JsonTable(rows);
+        });
+    }
+
+    public void clearTable(String tableName) {
+        tables.computeIfPresent(tableName, (name, table) -> {
+            table.clearData();
+            return table;
+        });
+    }
+
+    @Override
+    protected Map<String, Table> getTableMap() {
+        return Map.copyOf(tables);
+    }
+}
+```
+
+### 3.3. JsonTable — реализация Calcite Table
+
+```java
+package com.example.calcite.engine;
+
+import org.apache.calcite.DataContext;
+import org.apache.calcite.linq4j.AbstractEnumerable;
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.schema.ScannableTable;
+import org.apache.calcite.schema.impl.AbstractTable;
+import org.apache.calcite.sql.type.SqlTypeName;
+
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+/**
+ * Таблица Calcite, хранящая JSON-строки в памяти.
+ * Поддерживает динамическое определение схемы из данных.
+ */
+public class JsonTable extends AbstractTable implements ScannableTable {
+
+    private final CopyOnWriteArrayList<Map<String, Object>> data;
+    private volatile LinkedHashMap<String, SqlTypeName> columnTypes;
+
+    public JsonTable(List<Map<String, Object>> initialData) {
+        this.data = new CopyOnWriteArrayList<>(initialData);
+        this.columnTypes = inferSchema(initialData);
+    }
+
+    public void updateData(List<Map<String, Object>> newData) {
+        this.data.clear();
+        this.data.addAll(newData);
+        this.columnTypes = inferSchema(newData);
+    }
+
+    public void appendData(List<Map<String, Object>> newRows) {
+        this.data.addAll(newRows);
+        // Пересчитываем схему если появились новые колонки
+        this.columnTypes = inferSchema(this.data);
+    }
+
+    public void clearData() {
+        this.data.clear();
+    }
+
+    /**
+     * Определяем типы колонок из данных
+     */
+    private LinkedHashMap<String, SqlTypeName> inferSchema(List<Map<String, Object>> rows) {
+        LinkedHashMap<String, SqlTypeName> schema = new LinkedHashMap<>();
+        for (Map<String, Object> row : rows) {
+            for (Map.Entry<String, Object> entry : row.entrySet()) {
+                schema.putIfAbsent(entry.getKey(), inferSqlType(entry.getValue()));
+            }
+        }
+        if (schema.isEmpty()) {
+            schema.put("_empty", SqlTypeName.VARCHAR);
+        }
+        return schema;
+    }
+
+    private SqlTypeName inferSqlType(Object value) {
+        if (value == null) return SqlTypeName.VARCHAR;
+        if (value instanceof Integer) return SqlTypeName.INTEGER;
+        if (value instanceof Long) return SqlTypeName.BIGINT;
+        if (value instanceof Double || value instanceof Float) return SqlTypeName.DOUBLE;
+        if (value instanceof Boolean) return SqlTypeName.BOOLEAN;
+        if (value instanceof Number) return SqlTypeName.DECIMAL;
+        return SqlTypeName.VARCHAR;
+    }
+
+    @Override
+    public RelDataType getRowType(RelDataTypeFactory typeFactory) {
+        RelDataTypeFactory.Builder builder = typeFactory.builder();
+        LinkedHashMap<String, SqlTypeName> types = this.columnTypes;
+        for (Map.Entry<String, SqlTypeName> entry : types.entrySet()) {
+            if (entry.getValue() == SqlTypeName.VARCHAR) {
+                builder.add(entry.getKey(), 
+                    typeFactory.createSqlType(SqlTypeName.VARCHAR, 4096))
+                    .nullable(true);
+            } else {
+                builder.add(entry.getKey(), 
+                    typeFactory.createSqlType(entry.getValue()))
+                    .nullable(true);
+            }
+        }
+        return builder.build();
+    }
+
+    @Override
+    public Enumerable<Object[]> scan(DataContext root) {
+        final List<String> columnNames = new ArrayList<>(columnTypes.keySet());
+        // Снимаем snapshot данных для консистентного чтения
+        final List<Map<String, Object>> snapshot = List.copyOf(data);
+
+        return new AbstractEnumerable<>() {
+            @Override
+            public Enumerator<Object[]> enumerator() {
+                return new JsonEnumerator(snapshot, columnNames);
+            }
+        };
+    }
+
+    /**
+     * Enumerator для итерации по JSON-строкам
+     */
+    private static class JsonEnumerator implements Enumerator<Object[]> {
+        private final List<Map<String, Object>> data;
+        private final List<String> columns;
+        private int index = -1;
+
+        JsonEnumerator(List<Map<String, Object>> data, List<String> columns) {
+            this.data = data;
+            this.columns = columns;
+        }
+
+        @Override
+        public Object[] current() {
+            Map<String, Object> row = data.get(index);
+            Object[] result = new Object[columns.size()];
+            for (int i = 0; i < columns.size(); i++) {
+                Object val = row.get(columns.get(i));
+                // Calcite ожидает String для VARCHAR
+                if (val != null && !(val instanceof Number) && !(val instanceof Boolean)) {
+                    val = val.toString();
+                }
+                result[i] = val;
+            }
+            return result;
+        }
+
+        @Override
+        public boolean moveNext() {
+            return ++index < data.size();
+        }
+
+        @Override
+        public void reset() {
+            index = -1;
+        }
+
+        @Override
+        public void close() {
+            // no-op
+        }
+    }
+}
+```
+
+### 3.4. Главный движок — CalciteJsonEngine
+
+```java
+package com.example.calcite.engine;
+
+import com.example.calcite.model.QueryResponse;
+import com.example.calcite.model.StreamData;
+import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.calcite.jdbc.CalciteConnection;
+import org.apache.calcite.schema.SchemaPlus;
+import org.springframework.stereotype.Component;
+
+import java.sql.*;
+import java.util.*;
+
+/**
+ * Ядро обработки: принимает JSON-данные, загружает в Calcite-схему,
+ * выполняет SQL-запросы и возвращает результат в виде JSON.
+ */
+@Slf4j
+@Component
+public class CalciteJsonEngine {
+
+    private final JsonStreamSchema streamSchema;
+    private final CalciteConnection calciteConnection;
+
+    public CalciteJsonEngine() throws SQLException {
+        // Создаём in-memory Calcite connection
+        Properties props = new Properties();
+        props.setProperty("lex", "JAVA");           // case-sensitive идентификаторы
+        props.setProperty("caseSensitive", "false"); // SQL нечувствителен к регистру
+        props.setProperty("unquotedCasing", "UNCHANGED");
+        props.setProperty("quotedCasing", "UNCHANGED");
+
+        Connection connection = DriverManager.getConnection("jdbc:calcite:", props);
+        this.calciteConnection = connection.unwrap(CalciteConnection.class);
+
+        // Регистрируем схему
+        SchemaPlus rootSchema = calciteConnection.getRootSchema();
+        this.streamSchema = new JsonStreamSchema();
+        rootSchema.add("stream", streamSchema);
+
+        // Устанавливаем схему по умолчанию
+        calciteConnection.setSchema("stream");
+
+        log.info("CalciteJsonEngine initialized with schema 'stream'");
+    }
+
+    /**
+     * Загрузить/обновить данные таблицы из входящего JSON
+     */
+    public void loadData(StreamData streamData) {
+        String tableName = streamData.getTableName().toUpperCase();
+        streamSchema.updateTable(tableName, streamData.getRows());
+        log.debug("Table '{}' updated with {} rows", tableName, streamData.getRows().size());
+    }
+
+    /**
+     * Добавить данные в таблицу (append)
+     */
+    public void appendData(StreamData streamData) {
+        String tableName = streamData.getTableName().toUpperCase();
+        streamSchema.appendToTable(tableName, streamData.getRows());
+        log.debug("Table '{}' appended with {} rows", tableName, streamData.getRows().size());
+    }
+
+    /**
+     * Загрузить данные из "плоского" JSON (одна таблица "data")
+     */
+    public void loadData(String tableName, List<Map<String, Object>> rows) {
+        streamSchema.updateTable(tableName.toUpperCase(), rows);
+    }
+
+    /**
+     * Выполнить SQL-запрос и вернуть результат
+     */
+    public QueryResponse executeQuery(String sql, String subscriptionId) {
+        long startTime = System.currentTimeMillis();
+
+        try (Statement statement = calciteConnection.createStatement();
+             ResultSet rs = statement.executeQuery(sql)) {
+
+            ResultSetMetaData metaData = rs.getMetaData();
+            int columnCount = metaData.getColumnCount();
+
+            // Собираем имена колонок
+            List<String> columns = new ArrayList<>(columnCount);
+            for (int i = 1; i <= columnCount; i++) {
+                columns.add(metaData.getColumnLabel(i));
+            }
+
+            // Собираем строки
+            List<Map<String, Object>> rows = new ArrayList<>();
+            while (rs.next()) {
+                Map<String, Object> row = new LinkedHashMap<>(columnCount);
+                for (int i = 1; i <= columnCount; i++) {
+                    String colName = columns.get(i - 1);
+                    Object value = rs.getObject(i);
+                    row.put(colName, convertValue(value));
+                }
+                rows.add(row);
+            }
+
+            long executionTime = System.currentTimeMillis() - startTime;
+
+            return QueryResponse.builder()
+                    .subscriptionId(subscriptionId)
+                    .columns(columns)
+                    .rows(rows)
+                    .totalRows(rows.size())
+                    .executionTimeMs(executionTime)
+                    .build();
+
+        } catch (SQLException e) {
+            long executionTime = System.currentTimeMillis() - startTime;
+            log.error("SQL execution error for query [{}]: {}", sql, e.getMessage());
+
+            return QueryResponse.builder()
+                    .subscriptionId(subscriptionId)
+                    .error(e.getMessage())
+                    .rows(List.of())
+                    .columns(List.of())
+                    .totalRows(0)
+                    .executionTimeMs(executionTime)
+                    .build();
+        }
+    }
+
+    /**
+     * Конвертация значений для JSON-сериализации
+     */
+    private Object convertValue(Object value) {
+        if (value == null) return null;
+        if (value instanceof java.math.BigDecimal bd) {
+            // Убираем лишние нули
+            return bd.stripTrailingZeros().toPlainString();
+        }
+        return value;
+    }
+
+    @PreDestroy
+    public void destroy() throws SQLException {
+        if (calciteConnection != null && !calciteConnection.isClosed()) {
+            calciteConnection.close();
+            log.info("CalciteJsonEngine connection closed");
+        }
+    }
+}
+```
+
+### 3.5. Сервис-обработчик (связывает входной поток с клиентскими запросами)
+
+```java
+package com.example.calcite.service;
+
+import com.example.calcite.engine.CalciteJsonEngine;
+import com.example.calcite.model.QueryRequest;
+import com.example.calcite.model.QueryResponse;
+import com.example.calcite.model.StreamData;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+
+/**
+ * Сервис, управляющий:
+ * 1. Приёмом входящих JSON-данных и загрузкой в Calcite
+ * 2. Регистрацией подписок клиентов (SQL-запросы)
+ * 3. Выполнением запросов при обновлении данных
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class JsonQueryService {
+
+    private final CalciteJsonEngine calciteEngine;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * Подписки клиентов: subscriptionId -> (QueryRequest, callback)
+     */
+    private final ConcurrentHashMap<String, SubscriptionEntry> subscriptions = new ConcurrentHashMap<>();
+
+    /**
+     * Обработать входящий JSON-поток данных.
+     * Формат 1 (именованная таблица):
+     * {
+     *   "tableName": "orders",
+     *   "rows": [{"id": 1, "amount": 100}, ...]
+     * }
+     * 
+     * Формат 2 (простой массив → таблица "data"):
+     * [{"id": 1, "amount": 100}, ...]
+     * 
+     * Формат 3 (несколько таблиц):
+     * {
+     *   "tables": {
+     *     "orders": [{"id": 1}, ...],
+     *     "users": [{"id": 1, "name": "John"}, ...]
+     *   }
+     * }
+     */
+    public void processIncomingJson(String json) {
+        try {
+            JsonNode root = objectMapper.readTree(json);
+
+            if (root.isArray()) {
+                // Формат 2: массив → таблица "DATA"
+                List<Map<String, Object>> rows = objectMapper.convertValue(
+                    root, new TypeReference<>() {});
+                calciteEngine.loadData("DATA", rows);
+
+            } else if (root.has("tables")) {
+                // Формат 3: несколько таблиц
+                JsonNode tablesNode = root.get("tables");
+                Iterator<Map.Entry<String, JsonNode>> fields = tablesNode.fields();
+                while (fields.hasNext()) {
+                    Map.Entry<String, JsonNode> entry = fields.next();
+                    List<Map<String, Object>> rows = objectMapper.convertValue(
+                        entry.getValue(), new TypeReference<>() {});
+                    calciteEngine.loadData(entry.getKey(), rows);
+                }
+
+            } else if (root.has("tableName") && root.has("rows")) {
+                // Формат 1: именованная таблица
+                StreamData streamData = objectMapper.treeToValue(root, StreamData.class);
+                calciteEngine.loadData(streamData);
+
+            } else {
+                // Одиночный объект → таблица "DATA" с одной строкой
+                Map<String, Object> row = objectMapper.convertValue(
+                    root, new TypeReference<>() {});
+                calciteEngine.loadData("DATA", List.of(row));
+            }
+
+            // Уведомляем всех подписчиков
+            notifySubscribers();
+
+        } catch (Exception e) {
+            log.error("Error processing incoming JSON: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Выполнить одноразовый запрос (request-response)
+     */
+    public QueryResponse executeQuery(QueryRequest request) {
+        return calciteEngine.executeQuery(request.getSql(), request.getSubscriptionId());
+    }
+
+    /**
+     * Зарегистрировать подписку клиента — при каждом обновлении данных
+     * будет выполнен SQL и результат отправлен через callback
+     */
+    public void subscribe(String subscriptionId, String sql, Consumer<QueryResponse> callback) {
+        subscriptions.put(subscriptionId, new SubscriptionEntry(sql, callback));
+        log.info("Subscription registered: {} -> {}", subscriptionId, sql);
+
+        // Сразу выполняем запрос с текущими данными
+        try {
+            QueryResponse response = calciteEngine.executeQuery(sql, subscriptionId);
+            callback.accept(response);
+        } catch (Exception e) {
+            log.error("Error executing initial query for subscription {}: {}", 
+                subscriptionId, e.getMessage());
+        }
+    }
+
+    /**
+     * Удалить подписку
+     */
+    public void unsubscribe(String subscriptionId) {
+        subscriptions.remove(subscriptionId);
+        log.info("Subscription removed: {}", subscriptionId);
+    }
+
+    /**
+     * Уведомить всех подписчиков (выполнить их SQL-запросы)
+     */
+    private void notifySubscribers() {
+        subscriptions.forEach((subId, entry) -> {
+            Thread.startVirtualThread(() -> {
+                try {
+                    QueryResponse response = calciteEngine.executeQuery(entry.sql(), subId);
+                    entry.callback().accept(response);
+                } catch (Exception e) {
+                    log.error("Error notifying subscriber {}: {}", subId, e.getMessage());
+                }
+            });
+        });
+    }
+
+    private record SubscriptionEntry(String sql, Consumer<QueryResponse> callback) {}
+}
+```
+
+### 3.6. WebSocket конфигурация
+
+```java
+package com.example.calcite.config;
+
+import com.example.calcite.websocket.JsonQueryWebSocketHandler;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.socket.config.annotation.EnableWebSocket;
+import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
+import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
+import org.springframework.web.socket.server.standard.ServletServerContainerFactoryBean;
+
+@Configuration
+@EnableWebSocket
+@RequiredArgsConstructor
+public class WebSocketConfig implements WebSocketConfigurer {
+
+    private final JsonQueryWebSocketHandler queryWebSocketHandler;
+
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(queryWebSocketHandler, "/ws/query")
+                .setAllowedOrigins("*");
+    }
+
+    @Bean
+    public ServletServerContainerFactoryBean createWebSocketContainer() {
+        ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean();
+        container.setMaxTextMessageBufferSize(1024 * 1024); // 1MB
+        container.setMaxBinaryMessageBufferSize(1024 * 1024);
+        container.setMaxSessionIdleTimeout(600_000L); // 10 min
+        return container;
+    }
+}
+```
+
+### 3.7. WebSocket Handler
+
+```java
+package com.example.calcite.websocket;
+
+import com.example.calcite.model.QueryRequest;
+import com.example.calcite.model.QueryResponse;
+import com.example.calcite.service.JsonQueryService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+
+import java.io.IOException;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * WebSocket handler для клиентских запросов.
+ * 
+ * Протокол сообщений:
+ * 
+ * 1. Одноразовый запрос:
+ * {"type": "query", "sql": "SELECT * FROM data WHERE age > 25", "subscriptionId": "q1"}
+ * 
+ * 2. Подписка (получать обновления при изменении данных):
+ * {"type": "subscribe", "sql": "SELECT city, COUNT(*) as cnt FROM data GROUP BY city", "subscriptionId": "sub1"}
+ * 
+ * 3. Отписка:
+ * {"type": "unsubscribe", "subscriptionId": "sub1"}
+ * 
+ * 4. Загрузка данных (если клиент сам отправляет данные):
+ * {"type": "data", "payload": {"tableName": "orders", "rows": [...]}}
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class JsonQueryWebSocketHandler extends TextWebSocketHandler {
+
+    private final JsonQueryService queryService;
+    private final ObjectMapper objectMapper;
+
+    /** Отслеживаем подписки каждой сессии для cleanup */
+    private final ConcurrentHashMap<String, Set<String>> sessionSubscriptions = new ConcurrentHashMap<>();
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+        log.info("WebSocket connected: {}", session.getId());
+        sessionSubscriptions.put(session.getId(), ConcurrentHashMap.newKeySet());
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        Thread.startVirtualThread(() -> {
+            try {
+                processMessage(session, message.getPayload());
+            } catch (Exception e) {
+                log.error("Error processing message from {}: {}", session.getId(), e.getMessage());
+                sendError(session, null, e.getMessage());
+            }
+        });
+    }
+
+    private void processMessage(WebSocketSession session, String payload) throws Exception {
+        JsonNode root = objectMapper.readTree(payload);
+        String type = root.has("type") ? root.get("type").asText() : "query";
+
+        switch (type) {
+            case "query" -> handleQuery(session, root);
+            case "subscribe" -> handleSubscribe(session, root);
+            case "unsubscribe" -> handleUnsubscribe(session, root);
+            case "data" -> handleData(root);
+            default -> sendError(session, null, "Unknown message type: " + type);
+        }
+    }
+
+    /**
+     * Одноразовый SQL-запрос
+     */
+    private void handleQuery(WebSocketSession session, JsonNode root) {
+        String sql = root.get("sql").asText();
+        String subId = root.has("subscriptionId") 
+            ? root.get("subscriptionId").asText() 
+            : session.getId() + "-" + System.nanoTime();
+
+        QueryRequest request = QueryRequest.builder()
+                .sql(sql)
+                .subscriptionId(subId)
+                .build();
+
+        QueryResponse response = queryService.executeQuery(request);
+        sendResponse(session, response);
+    }
+
+    /**
+     * Подписка — результат SQL будет отправляться при каждом обновлении данных
+     */
+    private void handleSubscribe(WebSocketSession session, JsonNode root) {
+        String sql = root.get("sql").asText();
+        String subId = root.has("subscriptionId") 
+            ? root.get("subscriptionId").asText() 
+            : session.getId() + "-sub-" + System.nanoTime();
+
+        // Запоминаем подписку для cleanup при disconnect
+        sessionSubscriptions.computeIfAbsent(session.getId(), k -> ConcurrentHashMap.newKeySet())
+                .add(subId);
+
+        queryService.subscribe(subId, sql, response -> {
+            if (session.isOpen()) {
+                sendResponse(session, response);
+            } else {
+                queryService.unsubscribe(subId);
+            }
+        });
+    }
+
+    /**
+     * Отписка
+     */
+    private void handleUnsubscribe(WebSocketSession session, JsonNode root) {
+        String subId = root.get("subscriptionId").asText();
+        queryService.unsubscribe(subId);
+        sessionSubscriptions.getOrDefault(session.getId(), Set.of()).remove(subId);
+    }
+
+    /**
+     * Клиент отправляет данные для загрузки
+     */
+    private void handleData(JsonNode root) {
+        JsonNode payload = root.get("payload");
+        queryService.processIncomingJson(payload.toString());
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        log.info("WebSocket disconnected: {} ({})", session.getId(), status);
+        // Удаляем все подписки этой сессии
+        Set<String> subs = sessionSubscriptions.remove(session.getId());
+        if (subs != null) {
+            subs.forEach(queryService::unsubscribe);
+        }
+    }
+
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable exception) {
+        log.error("WebSocket transport error for {}: {}", session.getId(), exception.getMessage());
+    }
+
+    private void sendResponse(WebSocketSession session, QueryResponse response) {
+        try {
+            String json = objectMapper.writeValueAsString(response);
+            synchronized (session) {
+                if (session.isOpen()) {
+                    session.sendMessage(new TextMessage(json));
+                }
+            }
+        } catch (IOException e) {
+            log.error("Error sending response to {}: {}", session.getId(), e.getMessage());
+        }
+    }
+
+    private void sendError(WebSocketSession session, String subscriptionId, String error) {
+        QueryResponse response = QueryResponse.builder()
+                .subscriptionId(subscriptionId)
+                .error(error)
+                .rows(List.of())
+                .columns(List.of())
+                .totalRows(0)
+                .build();
+        sendResponse(session, response);
+    }
+}
+```
+
+### 3.8. Контроллер для входного потока данных (REST endpoint)
+
+```java
+package com.example.calcite.controller;
+
+import com.example.calcite.model.QueryRequest;
+import com.example.calcite.model.QueryResponse;
+import com.example.calcite.service.JsonQueryService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.*;
+
+/**
+ * REST-контроллер для:
+ * 1. Приёма входящих JSON-данных (от внешнего источника)
+ * 2. Одноразовых SQL-запросов (для тестирования)
+ */
+@RestController
+@RequestMapping("/api")
+@RequiredArgsConstructor
+public class DataIngestionController {
+
+    private final JsonQueryService queryService;
+
+    /**
+     * Приём входящих данных от внешнего источника
+     * POST /api/ingest
+     * Body: JSON в любом из поддерживаемых форматов
+     */
+    @PostMapping(value = "/ingest", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public String ingestData(@RequestBody String json) {
+        queryService.processIncomingJson(json);
+        return "{\"status\": \"ok\"}";
+    }
+
+    /**
+     * Одноразовый SQL-запрос (для отладки)
+     * POST /api/query
+     * Body: {"sql": "SELECT * FROM data WHERE ...", "subscriptionId": "test"}
+     */
+    @PostMapping(value = "/query", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public QueryResponse query(@RequestBody QueryRequest request) {
+        return queryService.executeQuery(request);
+    }
+}
+```
+
+### 3.9. Слушатель входного потока (пример с внешним WebSocket-источником)
+
+```java
+package com.example.calcite.ingest;
+
+import com.example.calcite.service.JsonQueryService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+/**
+ * Пример компонента, принимающего данные из внешнего источника.
+ * Можно подключить к Kafka, RabbitMQ, WebSocket-клиенту и т.д.
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class DataStreamListener {
+
+    private final JsonQueryService queryService;
+
+    /**
+     * Вызывается при получении данных из внешнего источника
+     */
+    public void onDataReceived(String json) {
+        log.debug("Received data stream: {} bytes", json.length());
+        queryService.processIncomingJson(json);
+    }
+}
+```
+
+## 4. Пример использования
+
+### Загрузка данных (POST /api/ingest):
+
+```json
+{
+  "tableName": "orders",
+  "rows": [
+    {"id": 1, "customer": "Alice", "amount": 150.0, "city": "Moscow", "status": "completed"},
+    {"id": 2, "customer": "Bob", "amount": 200.0, "city": "SPb", "status": "pending"},
+    {"id": 3, "customer": "Alice", "amount": 75.0, "city": "Moscow", "status": "completed"},
+    {"id": 4, "customer": "Charlie", "amount": 300.0, "city": "SPb", "status": "completed"},
+    {"id": 5, "customer": "Bob", "amount": 50.0, "city": "Moscow", "status": "cancelled"},
+    {"id": 6, "customer": "Diana", "amount": 420.0, "city": "Kazan", "status": "pending"},
+    {"id": 7, "customer": "Alice", "amount": 90.0, "city": "Moscow", "status": "pending"}
+  ]
+}
+```
+
+### WebSocket-сообщения клиентов:
+
+```json
+// Фильтрация
+{
+  "type": "query",
+  "sql": "SELECT * FROM orders WHERE status = 'completed' AND amount > 100",
+  "subscriptionId": "q1"
+}
+
+// Группировка + агрегация
+{
+  "type": "query",
+  "sql": "SELECT city, COUNT(*) as order_count, SUM(amount) as total FROM orders GROUP BY city ORDER BY total DESC",
+  "subscriptionId": "q2"
+}
+
+// Пагинация (LIMIT/OFFSET)
+{
+  "type": "query",
+  "sql": "SELECT * FROM orders ORDER BY amount DESC LIMIT 3 OFFSET 0",
+  "subscriptionId": "q3"
+}
+
+// Подписка — получать обновления при каждом изменении данных
+{
+  "type": "subscribe",
+  "sql": "SELECT customer, SUM(amount) as total_spent FROM orders WHERE status != 'cancelled' GROUP BY customer HAVING SUM(amount) > 100 ORDER BY total_spent DESC",
+  "subscriptionId": "dashboard-top-customers"
+}
+
+// Отписка
+{
+  "type": "unsubscribe",
+  "subscriptionId": "dashboard-top-customers"
+}
+```
+
+### Пример ответа:
+
+```json
+{
+  "subscriptionId": "q2",
+  "columns": ["city", "order_count", "total"],
+  "rows": [
+    {"city": "Moscow", "order_count": 4, "total": 365.0},
+    {"city": "SPb", "order_count": 2, "total": 500.0},
+    {"city": "Kazan", "order_count": 1, "total": 420.0}
+  ],
+  "totalRows": 3,
+  "executionTimeMs": 12
+}
+```
+
+## 5. Диаграмма потоков данных
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
+│  External Data  │────▶│  REST /api/ingest │────▶│                     │
+│  Source (JSON)  │     │  or WS "data"    │     │  JsonQueryService   │
+└─────────────────┘     └──────────────────┘     │                     │
+                                                  │  ┌───────────────┐ │
+                                                  │  │ CalciteJson   │ │
+                                                  │  │ Engine        │ │
+                                                  │  │               │ │
+                                                  │  │ ┌───────────┐ │ │
+                                                  │  │ │JsonStream │ │ │
+                                                  │  │ │Schema     │ │ │
+                                                  │  │ │           │ │ │
+                                                  │  │ │ orders ──▶│ │ │
+                                                  │  │ │ users  ──▶│ │ │
+                                                  │  │ │ data   ──▶│ │ │
+┌─────────────────┐     ┌──────────────────┐     │  │ └───────────┘ │ │
+│  WS Client 1    │◀───▶│  WebSocket       │◀───▶│  │               │ │
+│  SQL: SELECT..  │     │  Handler         │     │  │  SQL Engine   │ │
+│  WHERE city=... │     │  /ws/query       │     │  │  (Calcite)    │ │
+├─────────────────┤     │                  │     │  └───────────────┘ │
+│  WS Client 2    │◀───▶│  subscribe/      │◀───▶│                     │
+│  SQL: SELECT..  │     │  unsubscribe/    │     │  Subscriptions:     │
+│  GROUP BY...    │     │  query           │     │  sub1 → SQL + cb    │
+├─────────────────┤     │                  │     │  sub2 → SQL + cb    │
+│  WS Client N    │◀───▶│                  │◀───▶│  subN → SQL + cb    │
+│  SQL: SELECT..  │     └──────────────────┘     └─────────────────────┘
+│  LIMIT 10...    │
+└─────────────────┘
+```
+
+Ключевые моменты:
+
+- **Виртуальные потоки** — каждый подписчик уведомляется в своём виртуальном потоке (`Thread.startVirtualThread`)
+- **Потокобезопасность** — `ConcurrentHashMap`, `CopyOnWriteArrayList`, snapshot-чтение в `scan()`
+- **Динамическая схема** — типы колонок определяются автоматически из JSON-данных
+- **Три режима работы**: одноразовый запрос, подписка с обновлениями, загрузка данных через WS или REST
