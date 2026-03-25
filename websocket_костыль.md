@@ -87,6 +87,7 @@ useSourceIp
 loadBalancer:
   consistentHash:
     useSourceIp: true
+    
 Решение 3: Cookie через VirtualService
 
 Настройте VirtualService так, чтобы он устанавливал cookie на любой первый запрос:
