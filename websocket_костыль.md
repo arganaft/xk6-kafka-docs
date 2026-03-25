@@ -159,3 +159,99 @@ WebSocket
 Решение 1 — самое надёжное и правильное. Один 
 fetch
  перед подключением полностью решает проблему.
+
+
+
+Почему cookie генерируются только вашей страницей
+🔍 Механизм: кто генерирует cookie?
+Cookie генерирует не ваша страница и не ваше приложение, а Envoy (Istio sidecar). Вот как это работает:
+
+Когда в DestinationRule настроено:
+  consistentHash:
+    httpCookie:
+      name: 'session-affinity'
+      ttl: 3600s
+
+Envoy АВТОМАТИЧЕСКИ:
+1. Видит входящий HTTP-запрос БЕЗ cookie "session-affinity"
+2. Выбирает Pod
+3. Добавляет в ОТВЕТ заголовок: Set-Cookie: session-affinity=<hash>
+4. Браузер сохраняет эту cookie
+      
+🎯 Вот в чём разница между вашими страницами
+
+Ваша страница — работает ✅
+
+Шаг 1: GET /websocket/trades  ← ОБЫЧНЫЙ HTTP-запрос!
+        ↓
+        Envoy: "Cookie нет → выбираю Pod-A"
+        ↓
+        Ответ: 200 OK + Set-Cookie: session-affinity=abc123
+        ↓
+        Браузер: СОХРАНЯЕТ cookie ✅
+
+Шаг 2: WebSocket Upgrade /ws
+        ↓
+        Браузер АВТОМАТИЧЕСКИ прикрепляет: Cookie: session-affinity=abc123
+        ↓
+        Envoy: "Cookie есть → направляю на Pod-A" ✅
+
+Страница фронтендера — НЕ работает ❌
+Шаг 1: WebSocket Upgrade /ws  ← СРАЗУ WebSocket, без предварительного HTTP!
+        ↓
+        Envoy: "Cookie нет → выбираю Pod-A"
+        ↓
+        Ответ: 101 Switching Protocols + Set-Cookie: session-affinity=abc123
+        ↓
+        Браузер: ИГНОРИРУЕТ Set-Cookie из ответа 101 ❌❌❌
+⚡ Ключевая проблема
+
+
+Браузеры игнорируют 
+Set-Cookie
+ в ответе 
+101 Switching Protocols
+.
+
+
+Это известное поведение — cookie устанавливаются только из обычных HTTP-ответов (200, 301, 302 и т.д.), но не из 101 Switching Protocols.
+
+
+
+Именно поэтому:
+
+Ваша страница сначала делает
+GET /websocket/trades
+(обычный HTTP → cookie сохраняется), а потом WebSocket
+Страница фронтендера сразу делает WebSocket (101 → cookie НЕ сохраняется)
+После захода на вашу страницу cookie уже есть в браузере → страница фронтендера начинает работать
+
+
+✅ Решения (несколько вариантов, выберите удобный)
+
+Вариант 1: REST-endpoint для "прогрева" cookie (самый надёжный)
+
+На бэкенде добавьте:
+
+@RestController
+public class SessionInitController {
+
+    @GetMapping("/api/ws-init")
+    public ResponseEntity<Map<String, String>> initSession() {
+        // Тело не важно. Важно что это обычный HTTP-запрос,
+        // и Envoy добавит Set-Cookie в ответ.
+        return ResponseEntity.ok(Map.of("status", "ready"));
+    }
+}
+
+Фронтендер должен вызвать ДО подключения WebSocket:
+async connect() {
+    // 1. Обычный HTTP → Envoy установит cookie
+    await fetch('/api/ws-init', { 
+        credentials: 'include'   // ← ОБЯЗАТЕЛЬНО для cross-origin
+    });
+    
+    // 2. Теперь WebSocket — cookie уже в браузере
+    this.initializeStompClient();
+    this.stompClient.activate();
+}
