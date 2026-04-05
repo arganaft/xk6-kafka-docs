@@ -40,11 +40,18 @@
 
 однако в этой статье: https://pcnews.ru/blogs/osobennosti_ispolzovania_druid_na_primere_odnoklassnikov-849594.html#gsc.tab=0
 говорится что:
-В аналитической базе данных Apache Druid пропускная способность (QPS, запросов в секунду) в production-кластерах достигает 1000–1400 QPS при сложных агрегациях на больших объёмах данных, как показывают бенчмарки от Imply и System Overflow. Задержка (latency) обычно субсекундная: p99 под 500 мс при 1000 QPS или средняя 300 мс в реальных сценариях
-Ключевые бенчмарки QPS
-Кластер из 20 historical-нод (по 500 ГБ на NVMe SSD): 1000 QPS с p99 <500 мс на индексированных данных.
-POC Imply: 1400 QPS на сложных запросах (агрегации/фильтры), превосходя ClickHouse и Pinot.
-Target: >4 млн запросов/день (~46 QPS средне), Confluent: 350 QPS при 5 млн событий/с.
+В аналитической базе данных Apache Druid пропускная способность (QPS, запросов в секунду) в production-кластерах достигает 1000–1400 QPS при сложных агрегациях на больших объёмах данных, как показывают бенчмарки от Imply и System Overflow. Задержка (latency) обычно субсекундная: p99 под 500 мс при 1000 QPS или средняя 300 мс в реальных сценариях, благодаря columnar-хранению, индексам и распределённой обработке. [pcnews](https://pcnews.ru/blogs/osobennosti_ispolzovania_druid_na_primere_odnoklassnikov-849594.html)
+
+## Ключевые бенчмарки QPS
+- Кластер из 20 historical-нод (по 500 ГБ на NVMe SSD): 1000 QPS с p99 <500 мс на индексированных данных. [cloud.vk](https://cloud.vk.com/blog/kejs-airbnb-kak-uskorit-analitiku-s-pomoshh/)
+- POC Imply: 1400 QPS на сложных запросах (агрегации/фильтры), превосходя ClickHouse и Pinot. [pcnews](https://pcnews.ru/blogs/osobennosti_ispolzovania_druid_na_primere_odnoklassnikov-849594.html)
+- Target: >4 млн запросов/день (~46 QPS средне), Confluent: 350 QPS при 5 млн событий/с. [pcnews](https://pcnews.ru/blogs/osobennosti_ispolzovania_druid_na_primere_odnoklassnikov-849594.html)
+
+## Результаты по задержке
+- Типичные запросы (фильтр по времени + агрегация): 80–150 мс на сегмент, общий <500 мс благодаря партиционированию по времени и bitmap-индексам. [cloud.vk](https://cloud.vk.com/blog/kejs-airbnb-kak-uskorit-analitiku-s-pomoshh/)
+- SSB-бенчмарк (Imply vs BigQuery): Druid в 3,1 раза быстрее (средняя 0,5 с/запрос). [imply](https://imply.io/blog/apache-druid-google-bigquery-benchmark/)
+- Одноклассники (12 нод): инжест 500 тыс. событий/с, отклик графиков <2 с (vs 6 с ранее). [pvsm](https://www.pvsm.ru/vy-sokaya-proizvoditel-nost/291692)
+
 
 тесты с деградацией можно увидеть вэтом источнике: https://wikitech.wikimedia.org/w/index.php?title=Data_Platform/Systems/Druid/Load_test&oldid=2201673
 | Тип датасета | Тип запроса | Задержка (средняя) | Предельная нагрузка (QPS) |
