@@ -101,3 +101,18 @@ Flink TPC-DS benchmark тестирует до 99 SQL-запросов на да
 
 Flink использует MiniBatch-агрегацию для повышения throughput при частых обновлениях и откатах, минимизируя доступ к состоянию. [bigdataschool](https://bigdataschool.ru/blog/minibatch-optimization-in-flink-sql/)
 
+
+## Сравнение производительности с Apache Flink и Kafka Streams
+
+В тестах на wordcount и join'ах Flink показывает throughput до 2–5x выше (миллионы events/sec) при latency 10–50 мс vs 100–500 мс у Kafka Streams, благодаря unified batch/streaming API и RocksDB state backend. [onehouse](https://www.onehouse.ai/blog/apache-spark-structured-streaming-vs-apache-flink-vs-apache-kafka-streams-comparing-stream-processing-engines)
+
+Kafka Streams выигрывает в простых stateless операциях (до 1M events/sec на одном ноде), но при росте состояния (>100 ГБ) Flink масштабируется лучше за счет чекпойнтов и dynamic scaling. [confluent](https://www.confluent.io/es-es/blog/apache-flink-apache-kafka-streams-comparison-guideline-users/)
+
+## Сравнение ключевых метрик
+
+| Метрика | Flink | Kafka Streams | Примечание |
+|---------|-------|---------------|------------|
+| Latency (p99) | 10–100 мс | 50–500 мс | Flink true streaming, KS micro-batch  [bigdataschool](https://bigdataschool.ru/blog/big-data-streaming-kafka-streams-vs-spark-vs-flink-vs-storm-vs-samza/) |
+| Throughput | >1M events/sec | 500k–1M events/sec | Stateful агрегации, кластер 10+ нод  [vectorcore](https://vectorcore.digital/article-kafka.php) |
+| State size | ТБ (RocksDB) | ГБ (changelog) | Flink для MV-подписок  [redpanda](https://www.redpanda.com/guides/event-stream-processing-kafka-streams-vs-flink) |
+| SQL поддержка | Полная (Table API) | Базовая (DSL) | Flink для сложных GROUP BY  [instaclustr](https://www.instaclustr.com/blog/apache-flink-vs-apache-kafka-streams/) |
