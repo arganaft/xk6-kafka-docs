@@ -84,3 +84,20 @@ https://risingwave.com/blog/flink-vs-risingwave-real-time-analytics-benchmark/
 | p99 (Q4, Join+Agg) | 980 ms | 4,200 ms | Flink может вызывать заметные задержки |
 | Всплеск при чекпоинте | Не зафиксирован | 200 - 800 ms | Обновление отчета может «замирать» |
 | Интервал чекпоинтов | 1 секунда (стандарт) | 30 сек - 5 мин (типично) | Влияет на время восстановления |
+
+## Еще один бенчмарк Flink с подписной моделью но с 99 SQL запросами
+
+Flink TPC-DS benchmark тестирует до 99 SQL-запросов на датасетах до 10 ТБ (SCALE=10000 ГБ), имитируя аналитику с агрегациями, группировками и join'ами; данные генерируются в HDFS/Hive, объем входных данных — терабайты, с поддержкой partitioned таблиц для частых обновлений. [github](https://github.com/ververica/flink-sql-benchmark)
+
+В бенчмарке на синтетических clickstream-данных (10 млн событий, 5–50k events/sec) и NYC Taxi (1.5 млрд записей) Flink достигает latency ≤100 мс при 8–12k events/sec для windowed агрегаций и joins, с throughput 12k events/sec в stateful операциях. [bigdataschool](https://bigdataschool.ru/blog/batch-and-streaming-analytics-with-flink-use-cases/)
+
+## Сравнение с Druid и альтернативами
+
+| Фреймворк | Latency (мс) | Throughput (events/sec) | Объем данных / Запросов | Примечание |
+|-----------|--------------|--------------------------|--------------------------|------------|
+| Flink    | ≤100        | 12 000                  | 10M+ events, 99 SQL (TPC-DS) | Идеален для реал-тайм MV с CDC  [ijirt](https://ijirt.org/publishedpaper/IJIRT174423_PAPER.pdf) |
+| Druid    | Sub-second  | Высокий QPS на TB-PB    | OLAP-запросы, но низкая ingest для частых CDC | Проблемы с высокой частотой обновлений  [imply](https://imply.io/developer/articles/apache-kafka-flink-and-druid-open-source-essentials-for-real-time-data-products/) |
+| Spark Streaming | 500–2000 | 8 000                | Micro-batch, хуже для множества подписок |  [bigdataschool](https://bigdataschool.ru/blog/batch-and-streaming-analytics-with-flink-use-cases/) |
+
+Flink использует MiniBatch-агрегацию для повышения throughput при частых обновлениях и откатах, минимизируя доступ к состоянию. [bigdataschool](https://bigdataschool.ru/blog/minibatch-optimization-in-flink-sql/)
+
