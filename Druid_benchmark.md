@@ -25,3 +25,4 @@
 | Q13 (Сложный) | 43 | 113 | 320 | 7.44x |
 
 *   **Вывод**: По данным авторов теста, в этом конкретном сценарии (SSB Flat-table на 100GB) **StarRocks оказался примерно в 4.75 раза быстрее Druid**, а ClickHouse — в 1.87 раза быстрее Druid .
+источник: http://docs.mirrorship.cn/docs/benchmarking/SSB_Benchmarking
