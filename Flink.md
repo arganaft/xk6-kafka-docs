@@ -166,3 +166,97 @@ spec:
 * **EntryPoint**: Убедитесь, что в вашем Docker-образе прописан скрипт `docker-entrypoint.sh`. Стандартные образы Flink его имеют, и команды `jobmanager` / `taskmanager` запустят нужные процессы автоматически.
 
 Нужно ли вам помочь с настройкой `resources` для CPU/RAM под конкретные лимиты вашего железа?
+
+
+### при запуске docker файла в POD появляется такая ошибка:
+/opt/flink/bin/config-parser-utils.sh: line 42: /opt/flink/conf/config.yaml: Read-only file system
+/opt/flink/bin/config-parser-utils.sh: line 42: /opt/flink/conf/config.yaml: Read-only file system
+Usage: docker-entrypoint.sh (jobmanager|standalone-job|taskmanager|history-server)
+    Or docker-entrypoint.sh help
+By default, Flink image adopts jemalloc as default memory allocator. This behavior can be disabled by setting the 'DISABLE_JEMALLOC' environment variable to 'true'.
+я в файлах Kubernetes я удалил все ссылки на /opt/flink/bin но он почему то опять пытается туда записывать, возможно причина в том что  docker-entrypoint.sh прописан этот путь, можно ли его переопределить? 
+
+# Это классическая проблема при запуске Flink в Kubernetes. Ошибка возникает из-за того, что когда вы монтируете `ConfigMap` прямо в директорию `/opt/flink/conf`, Kubernetes делает всю эту директорию (или файлы в ней) **read-only**.
+
+Скрипт `docker-entrypoint.sh` (и вызываемый им парсер конфигурации) при запуске пытается динамически изменять или создавать файлы в папке `conf` (например, для настройки памяти или записи обработанного `config.yaml`). Так как файловая система только для чтения, он "падает".
+
+Вот три способа решить эту проблему, от самого правильного до самого простого:
+
+---
+
+### Решение 1: Использование InitContainer и emptyDir (Самое надежное)
+Это стандартный путь для Flink. Мы создаем пустую временную папку (`emptyDir`), которая разрешает запись, и перед запуском основного контейнера копируем туда конфиги из ConfigMap.
+
+Вставьте это в `spec` вашего **Deployment** (и для JobManager, и для TaskManager):
+
+```yaml
+spec:
+  template:
+    spec:
+      # 1. Создаем общее хранилище в памяти для конфигов
+      volumes:
+        - name: flink-config-writable
+          emptyDir: {}
+        - name: flink-config-readonly
+          configMap:
+            name: flink-config
+
+      # 2. Копируем файлы из Read-Only в Writable перед стартом
+      initContainers:
+      - name: copy-configs
+        image: busybox
+        command: ['sh', '-c', 'cp /config-readonly/* /config-writable/']
+        volumeMounts:
+        - name: flink-config-readonly
+          mountPath: /config-readonly
+        - name: flink-config-writable
+          mountPath: /config-writable
+
+      containers:
+      - name: jobmanager # или taskmanager
+        image: <ВАШ_ОБРАЗ>
+        # ... остальные настройки ...
+        volumeMounts:
+        - name: flink-config-writable
+          mountPath: /opt/flink/conf # Теперь это папка с правами на запись
+```
+
+---
+
+### Решение 2: Использование subPath (Самое быстрое)
+Если вы монтируете файл через `subPath`, Kubernetes монтирует только конкретный файл, а не всю директорию. Сама директория `/opt/flink/conf` остается частью образа и доступна для записи.
+
+**Но будьте осторожны:** если Flink захочет изменить именно файл `config.yaml`, он все равно выдаст ошибку. Однако часто ему нужно просто создать соседние файлы.
+
+```yaml
+        volumeMounts:
+        - name: flink-config-volume
+          mountPath: /opt/flink/conf/config.yaml # или flink-conf.yaml
+          subPath: config.yaml
+```
+
+*Примечание: В Flink 1.18+ файл конфигурации называется `config.yaml`, в более старых — `flink-conf.yaml`. Судя по вашей ошибке, у вас новая версия.*
+
+---
+
+### Решение 3: Передача настроек через Environment Variables
+Если настроек немного, вы можете вообще не монтировать ConfigMap как файл, а использовать переменную окружения `FLINK_PROPERTIES`. Скрипт `docker-entrypoint.sh` умеет подхватывать её и генерировать конфиг самостоятельно.
+
+```yaml
+      containers:
+      - name: jobmanager
+        env:
+        - name: FLINK_PROPERTIES
+          value: |
+            jobmanager.rpc.address: flink-jobmanager
+            taskmanager.numberOfTaskSlots: 2
+            jobmanager.memory.process.size: 1600m
+```
+В этом случае вам вообще не нужно трогать `/opt/flink/conf`, и ошибок записи не будет.
+
+---
+
+### Почему ваше удаление ссылок на `/opt/flink/bin` не помогло?
+Скрипты в `bin` — это "мозг" запуска Flink внутри контейнера. Даже если вы не вызываете их в YAML, их вызывает `docker-entrypoint.sh` (точка входа в Docker-образ). Переопределить их можно, изменив `command` или `args` в Kubernetes, но лучше не ломать логику старта, а просто дать Flink **права на запись** в его родную папку конфигов (как показано в Решении 1).
+
+Какую версию Flink вы используете? В версии 1.18 произошел переход на новый формат YAML, и если ваш `ConfigMap` написан в старом стиле, а образ новый — это тоже может вызвать проблемы с парсингом.
