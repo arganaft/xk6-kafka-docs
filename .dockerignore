@@ -1,0 +1,71 @@
+# === IDE и dev-инструменты ===
+.idea
+.idea/**
+.vscode
+.vscode/**
+*.iml
+*.swp
+*.swo
+
+# === Git ===
+.git
+**/.git
+.git/**
+.gitignore
+.gitattributes
+
+# === Maven build outputs ===
+**/target
+**/target/**
+**/build
+**/.mvn
+
+# === Node / NPM (Pinot UI) ===
+**/node_modules
+**/node_modules/**
+**/npm-debug.log
+**/.npm
+**/yarn.lock
+**/package-lock.json
+
+# === Pre-built distributions ===
+build
+build/**
+pinot-distribution/target
+**/dependency-reduced-pom.xml
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Docs / non-essentials ===
+docs
+docs/**
+website
+website/**
+contrib
+contrib/**
+
+# === CI ===
+.github
+.github/**
+.circleci
+.travis.yml
+appveyor.yml
+
+# === Docker / Build artifacts (не должны попадать в контекст) ===
+docker-compose*.yml
+**/trivy-*.txt
+build-all.ps1
+build-all.sh
+*.ps1
+*.tar.gz
+*.zip
+
+# === Логи ===
+**/*.log
+**/logs
+
+# === Test data (часто десятки MB) ===
+**/test-output
+**/*.iml
