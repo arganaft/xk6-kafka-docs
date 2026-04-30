@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=pinot-base:latest
+FROM ${BASE_IMAGE}
+
+ENV PINOT_ROLE=minion \
+    PINOT_HEAP_MIN=8g \
+    PINOT_HEAP_MAX=8g \
+    PINOT_GC_PROFILE=parallel \
+    PINOT_CONFIG=/etc/pinot/minion.conf
+
+EXPOSE 9514 8888
+
+ENTRYPOINT ["/opt/pinot/bin/pinot-launcher.sh"]
+CMD ["StartMinion"]
