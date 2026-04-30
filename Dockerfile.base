@@ -1,0 +1,154 @@
+# syntax=docker/dockerfile:1.7
+
+ARG WOLFI_BASE_TAG=latest
+ARG PINOT_VERSION=1.5.0-SNAPSHOT
+ARG JDK_VERSION=21
+
+############################
+# Stage 1: build
+#  Wolfi base + openjdk-21 + maven-3.9
+#  protoc — НЕ ставим в систему: protobuf-maven-plugin сам скачает нужную версию
+############################
+FROM cgr.dev/chainguard/wolfi-base:${WOLFI_BASE_TAG} AS build
+
+ARG PINOT_VERSION
+ARG JDK_VERSION
+
+USER root
+WORKDIR /src
+
+# Wolfi-пакеты для сборки
+# В build-стадии:
+# Wolfi-пакеты для сборки (с retry на случай нестабильной сети)
+RUN set -eux; \
+    for i in 1 2 3 4 5; do \
+        apk add --no-cache \
+            openjdk-${JDK_VERSION}-default-jdk \
+            maven-3.9 \
+            git \
+            bash \
+            curl \
+            ca-certificates && break; \
+        echo "[WARN] apk add failed on attempt $i, retrying in 10s..."; \
+        sleep 10; \
+    done; \
+    command -v javac >/dev/null || (echo "ERROR: javac not installed"; exit 1); \
+    command -v mvn   >/dev/null || (echo "ERROR: mvn not installed"; exit 1); \
+    command -v git   >/dev/null || (echo "ERROR: git not installed"; exit 1)
+
+ENV JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk
+ENV PATH=$JAVA_HOME/bin:/usr/bin:/bin
+
+# Sanity-checks: версия JDK, наличие javac, и Maven
+RUN set -eux; \
+    java -version 2>&1 | tee /tmp/javaver; \
+    grep -E "openjdk version \"${JDK_VERSION}\." /tmp/javaver \
+      || (echo "ERROR: expected JDK ${JDK_VERSION}"; exit 1); \
+    javac -version 2>&1 | tee /tmp/javacver; \
+    grep -E "javac ${JDK_VERSION}\." /tmp/javacver \
+      || (echo "ERROR: javac ${JDK_VERSION} not working"; exit 1); \
+    java --list-modules | grep -q '^jdk.compiler@' \
+      || (echo "ERROR: jdk.compiler module missing"; exit 1); \
+    mvn -version | tee /tmp/mvnver
+
+COPY . /src
+
+# Главное: НЕ передаём -Dprotoc.executable — пусть плагин сам скачает совместимую версию
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -ntp -T2 -Pbin-dist \
+        -Djdk.version=${JDK_VERSION} \
+        -Dmaven.test.skip=true \
+        -Dinvoker.skip=true \
+        -Drat.skip=true \
+        -Dlicense.skip=true \
+        -Dcheckstyle.skip=true \
+        -Dspotless.check.skip=true \
+        -Dmaven.buildNumber.skip=true \
+        -DskipTests \
+        clean install
+
+# Распаковка bin-дистрибутива и удаление лишнего
+RUN set -eux; \
+    mkdir -p /opt/pinot; \
+    TARBALL="$(ls build/apache-pinot-*-bin.tar.gz | head -n1)"; \
+    echo "Using tarball: ${TARBALL}"; \
+    tar -xzf "${TARBALL}" --strip-components=1 -C /opt/pinot; \
+    find /opt/pinot -type d -name 'sources' -prune -exec rm -rf {} +; \
+    find /opt/pinot -name '*.md' -delete; \
+    rm -rf /opt/pinot/licenses-binary /opt/pinot/NOTICE-binary || true
+
+# JMX exporter и OpenTelemetry agent
+RUN curl -fsSL -o /opt/pinot/lib/jmx_prometheus_javaagent.jar \
+      https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/1.0.1/jmx_prometheus_javaagent-1.0.1.jar && \
+    curl -fsSL -o /opt/pinot/lib/opentelemetry-javaagent.jar \
+      https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.10.0/opentelemetry-javaagent.jar
+
+# AppCDS (опционально, не падаем если не получилось)
+RUN java -XX:ArchiveClassesAtExit=/opt/pinot/lib/pinot.jsa \
+         -cp "/opt/pinot/lib/*" \
+         org.apache.pinot.tools.admin.PinotAdministrator -help 2>/dev/null || true
+
+############################
+# Stage 2: runtime
+#  Wolfi base + openjdk-21-jre (только runtime, минимум поверхности атаки)
+############################
+FROM cgr.dev/chainguard/wolfi-base:${WOLFI_BASE_TAG} AS pinot-base
+
+ARG PINOT_VERSION
+ARG JDK_VERSION
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="Apache Pinot (Wolfi glibc, openjdk-${JDK_VERSION})"
+LABEL org.opencontainers.image.description="Apache Pinot built from source on Chainguard Wolfi"
+LABEL org.opencontainers.image.version="${PINOT_VERSION}"
+LABEL org.opencontainers.image.revision="${VCS_REF}"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.source="https://github.com/apache/pinot"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL io.pinot.version="${PINOT_VERSION}"
+LABEL io.pinot.jdk="${JDK_VERSION}"
+
+USER root
+
+# Только runtime-пакеты
+# В runtime-стадии аналогично:
+RUN set -eux; \
+    for i in 1 2 3 4 5; do \
+        apk add --no-cache \
+            openjdk-${JDK_VERSION}-jre \
+            tini \
+            ca-certificates-bundle \
+            curl && break; \
+        echo "[WARN] apk add failed on attempt $i, retrying in 10s..."; \
+        sleep 10; \
+    done; \
+    command -v java >/dev/null || (echo "ERROR: java not installed"; exit 1); \
+    [ -x /sbin/tini ] || [ -x /usr/bin/tini ] || (echo "ERROR: tini not installed"; exit 1)
+
+
+RUN mkdir -p /var/log/pinot /etc/pinot /data/pinot /opt/pinot/bin
+
+COPY --from=build /opt/pinot /opt/pinot
+COPY --chmod=0755 docker/images/pinot/bin/pinot-launcher.sh /opt/pinot/bin/pinot-launcher.sh
+COPY              docker/images/pinot/etc/jmx-exporter-config.yaml /opt/pinot/etc/jmx-exporter-config.yaml
+
+RUN chown -R 65532:65532 /opt/pinot /var/log/pinot /etc/pinot /data/pinot
+
+ENV JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk \
+    PATH=/usr/lib/jvm/java-${JDK_VERSION}-openjdk/bin:/opt/pinot/bin:/usr/bin:/bin \
+    PINOT_HOME=/opt/pinot \
+    PINOT_VERSION=${PINOT_VERSION} \
+    PINOT_HEAP_MIN=2g \
+    PINOT_HEAP_MAX=2g \
+    PINOT_GC_PROFILE=auto \
+    PINOT_JMX_PORT=8888 \
+    PINOT_DISABLE_JMX=false
+
+USER 65532
+WORKDIR /opt/pinot
+
+EXPOSE 8888
+
+ENTRYPOINT ["/sbin/tini", "--", "/opt/pinot/bin/pinot-launcher.sh"]
+CMD ["StartController"]
