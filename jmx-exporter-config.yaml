@@ -1,0 +1,14 @@
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+rules:
+  # Pinot
+  - pattern: 'org\.apache\.pinot<type=([^,]+), name=([^>]+)><>(\w+)'
+    name: pinot_$1_$2_$3
+    cache: true
+  # JVM
+  - pattern: 'java\.lang<type=Memory><HeapMemoryUsage>(\w+)'
+    name: jvm_memory_heap_$1
+    type: GAUGE
+  - pattern: 'java\.lang<type=GarbageCollector, name=([^>]+)><>(\w+)'
+    name: jvm_gc_$1_$2
+    labels: { gc: "$1" }
