@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1.7
+
+ARG WOLFI_TAG=latest
+ARG PINOT_VERSION=1.5.0-SNAPSHOT
+ARG JDK_VERSION=21
+
+############################
+# Stage 1: build (Wolfi + OpenJDK 21 JDK + Maven)
+############################
+FROM cgr.dev/chainguard/wolfi-base:${WOLFI_TAG} AS build
+
+ARG PINOT_VERSION
+ARG JDK_VERSION
+
+USER root
+WORKDIR /src
+
+RUN apk add --no-cache \
+        openjdk-${JDK_VERSION}-default-jdk \
+        maven \
+        git \
+        bash
+
+ENV JAVA_HOME=/usr/lib/jvm/default-jvm
+ENV PATH=/usr/lib/jvm/default-jvm/bin:/usr/bin:/bin
+
+COPY . /src
+
+RUN --mount=type=cache,target=/root/.m2 \
+    java -version && javac -version && mvn -version && \
+    mvn -B -ntp -T1C -DskipTests -Pbin-dist \
+        -Djdk.version=${JDK_VERSION} \
+        -Dinvoker.skip=true \
+        -Drat.skip=true \
+        -Dlicense.skip=true \
+        -Dcheckstyle.skip=true \
+        -Dspotless.check.skip=true \
+        clean install
+
+RUN set -eux; \
+    mkdir -p /opt/pinot; \
+    TARBALL="$(ls build/apache-pinot-*-bin.tar.gz | head -n1)"; \
+    echo "Using tarball: ${TARBALL}"; \
+    tar -xzf "${TARBALL}" --strip-components=1 -C /opt/pinot; \
+    find /opt/pinot -type d -name 'sources' -prune -exec rm -rf {} +; \
+    find /opt/pinot -name '*.md' -delete; \
+    rm -rf /opt/pinot/licenses-binary /opt/pinot/NOTICE-binary || true; \
+    chown -R 65532:65532 /opt/pinot
+
+############################
+# Stage 2: runtime (Wolfi + JRE 21)
+############################
+FROM cgr.dev/chainguard/wolfi-base:${WOLFI_TAG}
+
+ARG PINOT_VERSION
+ARG JDK_VERSION
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="Apache Pinot (Wolfi hardened)"
+LABEL org.opencontainers.image.description="Apache Pinot built from source on Chainguard Wolfi"
+LABEL org.opencontainers.image.version="${PINOT_VERSION}"
+LABEL org.opencontainers.image.revision="${VCS_REF}"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.source="https://github.com/apache/pinot"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.base.name="cgr.dev/chainguard/wolfi-base:${WOLFI_TAG}"
+LABEL io.pinot.version="${PINOT_VERSION}"
+LABEL io.pinot.jdk="${JDK_VERSION}"
+
+RUN apk add --no-cache \
+        openjdk-${JDK_VERSION}-jre \
+        openjdk-${JDK_VERSION}-default-jvm \
+    && (adduser -D -u 65532 -g nonroot nonroot 2>/dev/null || true) \
+    && rm -rf /var/cache/apk/*
+
+ENV JAVA_HOME=/usr/lib/jvm/default-jvm
+ENV PATH=/usr/lib/jvm/default-jvm/bin:/opt/pinot/bin:/usr/bin:/bin
+ENV JAVA_OPTS=""
+ENV PINOT_HOME=/opt/pinot
+ENV PINOT_VERSION=${PINOT_VERSION}
+
+COPY --from=build --chown=65532:65532 /opt/pinot /opt/pinot
+
+USER
+WORKDIR /opt/pinot
+
+EXPOSE 8099 8098 8097 9000 7050 8096 8090 8008
+
+ENTRYPOINT ["java", "-cp", "/opt/pinot/lib/*", "org.apache.pinot.tools.admin.PinotAdministrator"]
+CMD ["StartController", "-help"]
