@@ -1,0 +1,9 @@
+<settings>
+  <mirrors>
+    <mirror>
+      <id>yandex-maven-central</id>
+      <mirrorOf>central</mirrorOf>
+      <url>https://repo1.maven.org/maven2/</url> <!-- или      https://nexus.market.yandex.net/content/groups/public/-->
+    </mirror>
+  </mirrors>
+</settings>
