@@ -1,0 +1,1105 @@
+Ниже шаблон, который можно взять как эталон. В нём есть два типа тестов:
+
+1. **Интеграционный WebSocket + Spring Context + ClickHouse Testcontainers**  
+   Проверяет реальный STOMP/WebSocket-флоу и формат сообщений. Значения строк не проверяются строго.
+
+2. **WebSocket-тест с mock базы / DAO**  
+   Проверяет тот же WebSocket-флоу, но слой ClickHouse замокан и возвращает заранее заданные строки. Здесь проверяем и формат, и конкретные данные.
+
+Вам почти наверняка нужно будет заменить только:
+
+- `RESPONSE_DESTINATION` — destination, куда ваш backend реально отправляет ответы.
+- `YourClickHouseRowsRepository`, `QueryPage` и методы mock-а — на ваш реальный DAO/service/port, который ходит в ClickHouse.
+
+---
+
+## 1. Структура файлов
+
+Пример структуры:
+
+```text
+src/test/java
+└── com/pivotService
+    ├── support
+    │   ├── BaseWebSocketTestSupport.java
+    │   ├── WebSocketJsonClient.java
+    │   ├── WebSocketResponseAssertions.java
+    │   ├── AbstractClickHouseWebSocketIT.java
+    │   └── AbstractMockWebSocketIT.java
+    └── controller
+        ├── TradeClientControllerWebSocketIT.java
+        └── TradeClientControllerWebSocketMockIT.java
+
+src/test/resources
+├── com/pivotService/controller/TradeClientControllerWebSocketIT
+│   └── set-view-config.request.json
+├── com/pivotService/controller/TradeClientControllerWebSocketMockIT
+│   ├── set-view-config.request.json
+│   └── receive-data.expected.json
+└── sql/clickhouse
+    ├── schema.sql
+    ├── fixture.sql
+    └── update-one-row.sql
+```
+
+---
+
+## 2. Зависимости для тестов
+
+<details>
+<summary>Пример Maven-зависимостей</summary>
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <scope>test</scope>
+    </dependency>
+
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>clickhouse</artifactId>
+        <scope>test</scope>
+    </dependency>
+
+    <dependency>
+        <groupId>com.clickhouse</groupId>
+        <artifactId>clickhouse-jdbc</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+`JSONAssert` уже входит в `spring-boot-starter-test`.
+
+</details>
+
+---
+
+## 3. WebSocket STOMP test client
+
+`src/test/java/com/pivotService/support/WebSocketJsonClient.java`
+
+```java
+package com.pivotService.support;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.messaging.converter.MappingJackson2MessageConverter;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompFrameHandler;
+import org.springframework.messaging.simp.stomp.StompHeaders;
+import org.springframework.messaging.simp.stomp.StompSession;
+import org.springframework.messaging.simp.stomp.StompSessionHandlerAdapter;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.util.MimeTypeUtils;
+import org.springframework.web.socket.WebSocketHttpHeaders;
+import org.springframework.web.socket.client.standard.StandardWebSocketClient;
+import org.springframework.web.socket.messaging.WebSocketStompClient;
+
+import java.lang.reflect.Type;
+import java.time.Duration;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+public final class WebSocketJsonClient implements AutoCloseable {
+
+    private final ObjectMapper objectMapper;
+    private final WebSocketStompClient stompClient;
+    private final ThreadPoolTaskScheduler taskScheduler;
+
+    private final BlockingQueue<JsonNode> messages = new LinkedBlockingQueue<>();
+    private final BlockingQueue<Throwable> errors = new LinkedBlockingQueue<>();
+
+    private StompSession session;
+    private StompSession.Subscription subscription;
+
+    public WebSocketJsonClient(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+
+        MappingJackson2MessageConverter messageConverter = new MappingJackson2MessageConverter();
+        messageConverter.setObjectMapper(objectMapper);
+        messageConverter.setStrictContentTypeMatch(false);
+
+        this.taskScheduler = new ThreadPoolTaskScheduler();
+        this.taskScheduler.setThreadNamePrefix("test-ws-client-heartbeat-");
+        this.taskScheduler.initialize();
+
+        this.stompClient = new WebSocketStompClient(new StandardWebSocketClient());
+        this.stompClient.setMessageConverter(messageConverter);
+        this.stompClient.setTaskScheduler(taskScheduler);
+        this.stompClient.setDefaultHeartbeat(new long[]{0, 0});
+    }
+
+    public void connect(String wsUrl, String subscriptionDestination) throws Exception {
+        StompSessionHandlerAdapter sessionHandler = new StompSessionHandlerAdapter() {
+            @Override
+            public void handleTransportError(StompSession session, Throwable exception) {
+                errors.add(exception);
+            }
+
+            @Override
+            public void handleException(
+                    StompSession session,
+                    StompCommand command,
+                    StompHeaders headers,
+                    byte[] payload,
+                    Throwable exception
+            ) {
+                errors.add(exception);
+            }
+        };
+
+        CompletableFuture<StompSession> future = stompClient.connectAsync(
+                wsUrl,
+                new WebSocketHttpHeaders(),
+                new StompHeaders(),
+                sessionHandler
+        );
+
+        this.session = future.get(5, TimeUnit.SECONDS);
+
+        this.subscription = this.session.subscribe(subscriptionDestination, new StompFrameHandler() {
+            @Override
+            public Type getPayloadType(StompHeaders headers) {
+                return JsonNode.class;
+            }
+
+            @Override
+            public void handleFrame(StompHeaders headers, Object payload) {
+                messages.add((JsonNode) payload);
+            }
+        });
+    }
+
+    public void send(String destination, JsonNode payload) {
+        if (session == null || !session.isConnected()) {
+            throw new IllegalStateException("STOMP session is not connected");
+        }
+
+        StompHeaders headers = new StompHeaders();
+        headers.setDestination(destination);
+        headers.setContentType(MimeTypeUtils.APPLICATION_JSON);
+
+        session.send(headers, payload);
+    }
+
+    public JsonNode awaitNext(Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+
+        while (System.nanoTime() < deadline) {
+            Throwable error = errors.poll();
+            if (error != null) {
+                throw new AssertionError("STOMP client error", error);
+            }
+
+            JsonNode message = messages.poll(100, TimeUnit.MILLISECONDS);
+            if (message != null) {
+                return message;
+            }
+        }
+
+        Throwable error = errors.poll();
+        if (error != null) {
+            throw new AssertionError("STOMP client error", error);
+        }
+
+        throw new AssertionError("No STOMP message received during " + timeout);
+    }
+
+    @Override
+    public void close() {
+        if (subscription != null) {
+            subscription.unsubscribe();
+        }
+
+        if (session != null && session.isConnected()) {
+            session.disconnect();
+        }
+
+        stompClient.stop();
+        taskScheduler.shutdown();
+    }
+}
+```
+
+---
+
+## 4. Базовый support-класс для WebSocket-тестов
+
+`src/test/java/com/pivotService/support/BaseWebSocketTestSupport.java`
+
+```java
+package com.pivotService.support;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.AfterEach;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.core.io.ClassPathResource;
+
+import java.io.InputStream;
+
+public abstract class BaseWebSocketTestSupport {
+
+    @LocalServerPort
+    protected int port;
+
+    @Autowired
+    protected ObjectMapper objectMapper;
+
+    protected WebSocketJsonClient webSocket;
+
+    @AfterEach
+    void closeWebSocket() {
+        if (webSocket != null) {
+            webSocket.close();
+        }
+    }
+
+    protected WebSocketJsonClient connectClient(String subscriptionDestination) throws Exception {
+        webSocket = new WebSocketJsonClient(objectMapper);
+        webSocket.connect("ws://localhost:" + port + "/ws", subscriptionDestination);
+        return webSocket;
+    }
+
+    protected JsonNode readJsonResource(String fileName) throws Exception {
+        String path = getClass().getPackageName().replace('.', '/')
+                + "/"
+                + getClass().getSimpleName()
+                + "/"
+                + fileName;
+
+        ClassPathResource resource = new ClassPathResource(path);
+
+        try (InputStream inputStream = resource.getInputStream()) {
+            return objectMapper.readTree(inputStream);
+        }
+    }
+}
+```
+
+Этот метод будет читать JSON из папки рядом с тестовым классом в `src/test/resources`.
+
+Например для класса:
+
+```java
+com.pivotService.controller.TradeClientControllerWebSocketIT
+```
+
+файл будет искаться здесь:
+
+```text
+src/test/resources/com/pivotService/controller/TradeClientControllerWebSocketIT/set-view-config.request.json
+```
+
+---
+
+## 5. Assertions для формата ответов
+
+`src/test/java/com/pivotService/support/WebSocketResponseAssertions.java`
+
+```java
+package com.pivotService.support;
+
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+
+public final class WebSocketResponseAssertions {
+
+    private WebSocketResponseAssertions() {
+    }
+
+    public static List<String> requestedFields(JsonNode request) {
+        JsonNode columns = request.at("/data/columns");
+
+        assertThat(columns.isArray())
+                .as("request.data.columns should be array")
+                .isTrue();
+
+        List<String> result = new ArrayList<>();
+
+        for (JsonNode column : columns) {
+            String fieldKey = column.path("fieldKey").asText(null);
+
+            assertThat(fieldKey)
+                    .as("column.fieldKey")
+                    .isNotBlank();
+
+            result.add(fieldKey);
+        }
+
+        return result;
+    }
+
+    public static void assertConfigurationUpdatedFormat(JsonNode actual, JsonNode originalRequest) {
+        assertThat(actual.path("type").asText())
+                .isEqualTo("ConfigurationUpdated");
+
+        assertThat(actual.path("success").asBoolean())
+                .isTrue();
+
+        JsonNode config = actual.get("config");
+
+        assertThat(config)
+                .as("config")
+                .isNotNull();
+
+        assertThat(config.isObject())
+                .as("config should be object")
+                .isTrue();
+
+        assertNumber(config, "liveBookId");
+        assertNumber(config, "startRow");
+        assertNumber(config, "endRow");
+
+        assertArray(config, "groupKeys");
+        assertObject(config, "filterModel");
+        assertArray(config, "sortModel");
+        assertArray(config, "columns");
+        assertArray(config, "rowGroupColumns");
+        assertArray(config, "valueColumns");
+
+        assertThat(config.path("pivotMode").isBoolean())
+                .as("config.pivotMode should be boolean")
+                .isTrue();
+
+        assertArray(config, "pivotColumns");
+
+        assertText(config, "requestId");
+        assertText(config, "clientId");
+
+        assertThat(config.path("requestId").asText())
+                .isEqualTo(originalRequest.at("/data/requestId").asText());
+
+        assertThat(config.path("clientId").asText())
+                .isEqualTo(originalRequest.at("/data/clientId").asText());
+
+        assertText(config, "liveBookName");
+
+        String timestamp = actual.path("timestamp").asText(null);
+
+        assertThat(timestamp)
+                .as("timestamp")
+                .isNotBlank();
+
+        assertThatCode(() -> Instant.parse(timestamp))
+                .as("timestamp should be ISO instant")
+                .doesNotThrowAnyException();
+
+        assertThat(actual.has("errorMessage"))
+                .as("errorMessage field should exist")
+                .isTrue();
+
+        JsonNode errorMessage = actual.get("errorMessage");
+
+        assertThat(errorMessage.isNull() || errorMessage.isTextual())
+                .as("errorMessage should be null or string")
+                .isTrue();
+    }
+
+    public static void assertReceiveDataFormat(JsonNode actual, List<String> expectedColumns) {
+        assertThat(actual.path("type").asText())
+                .isEqualTo("ReceiveData");
+
+        assertThat(actual.path("success").asBoolean())
+                .isTrue();
+
+        JsonNode data = actual.get("data");
+
+        assertThat(data)
+                .as("data")
+                .isNotNull();
+
+        assertThat(data.isArray())
+                .as("data should be array")
+                .isTrue();
+
+        assertThat(data.size())
+                .as("data should contain at least one block")
+                .isGreaterThan(0);
+
+        for (JsonNode dataBlock : data) {
+            assertText(dataBlock, "requestId");
+            assertNumber(dataBlock, "totalCount");
+
+            JsonNode rows = dataBlock.get("rows");
+
+            assertThat(rows)
+                    .as("rows")
+                    .isNotNull();
+
+            assertThat(rows.isArray())
+                    .as("rows should be array")
+                    .isTrue();
+
+            assertThat(rows.size())
+                    .as("rows should contain at least one row")
+                    .isGreaterThan(0);
+
+            for (JsonNode row : rows) {
+                assertThat(row.isObject())
+                        .as("row should be object")
+                        .isTrue();
+
+                assertThat(row.has("saved_at"))
+                        .as("row should contain saved_at")
+                        .isTrue();
+
+                for (String expectedColumn : expectedColumns) {
+                    assertThat(row.has(expectedColumn))
+                            .as("row should contain column '%s'. Row: %s", expectedColumn, row)
+                            .isTrue();
+                }
+            }
+        }
+    }
+
+    private static void assertText(JsonNode object, String fieldName) {
+        JsonNode value = object.get(fieldName);
+
+        assertThat(value)
+                .as(fieldName)
+                .isNotNull();
+
+        assertThat(value.isTextual())
+                .as(fieldName + " should be text")
+                .isTrue();
+
+        assertThat(value.asText())
+                .as(fieldName + " should not be blank")
+                .isNotBlank();
+    }
+
+    private static void assertNumber(JsonNode object, String fieldName) {
+        JsonNode value = object.get(fieldName);
+
+        assertThat(value)
+                .as(fieldName)
+                .isNotNull();
+
+        assertThat(value.isNumber())
+                .as(fieldName + " should be number")
+                .isTrue();
+    }
+
+    private static void assertArray(JsonNode object, String fieldName) {
+        JsonNode value = object.get(fieldName);
+
+        assertThat(value)
+                .as(fieldName)
+                .isNotNull();
+
+        assertThat(value.isArray())
+                .as(fieldName + " should be array")
+                .isTrue();
+    }
+
+    private static void assertObject(JsonNode object, String fieldName) {
+        JsonNode value = object.get(fieldName);
+
+        assertThat(value)
+                .as(fieldName)
+                .isNotNull();
+
+        assertThat(value.isObject())
+                .as(fieldName + " should be object")
+                .isTrue();
+    }
+}
+```
+
+---
+
+## 6. База для интеграционных тестов с ClickHouse Testcontainers
+
+`src/test/java/com/pivotService/support/AbstractClickHouseWebSocketIT.java`
+
+```java
+package com.pivotService.support;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.jdbc.datasource.DataSourceUtils;
+import org.springframework.jdbc.datasource.init.ScriptUtils;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.clickhouse.ClickHouseContainer;
+import org.testcontainers.utility.DockerImageName;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+public abstract class AbstractClickHouseWebSocketIT extends BaseWebSocketTestSupport {
+
+    private static final ClickHouseContainer CLICKHOUSE =
+            new ClickHouseContainer(DockerImageName.parse("clickhouse/clickhouse-server:24.8"));
+
+    static {
+        CLICKHOUSE.start();
+    }
+
+    @DynamicPropertySource
+    static void clickHouseProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", CLICKHOUSE::getJdbcUrl);
+        registry.add("spring.datasource.username", CLICKHOUSE::getUsername);
+        registry.add("spring.datasource.password", CLICKHOUSE::getPassword);
+        registry.add("spring.datasource.driver-class-name", () -> "com.clickhouse.jdbc.ClickHouseDriver");
+
+        /*
+         * Если у вас не spring.datasource.*, а кастомные properties, добавьте их здесь.
+         *
+         * Например:
+         *
+         * registry.add("app.clickhouse.url", CLICKHOUSE::getJdbcUrl);
+         * registry.add("app.clickhouse.username", CLICKHOUSE::getUsername);
+         * registry.add("app.clickhouse.password", CLICKHOUSE::getPassword);
+         */
+    }
+
+    @Autowired
+    private DataSource dataSource;
+
+    @BeforeEach
+    void reloadClickHouseFixture() {
+        runSqlScript("sql/clickhouse/schema.sql");
+        runSqlScript("sql/clickhouse/fixture.sql");
+    }
+
+    protected void runSqlScript(String classpathLocation) {
+        Connection connection = DataSourceUtils.getConnection(dataSource);
+
+        try {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource(classpathLocation));
+        } finally {
+            DataSourceUtils.releaseConnection(connection, dataSource);
+        }
+    }
+}
+```
+
+Spring будет кэшировать контекст между тестовыми классами, если они используют одинаковые настройки. Поэтому все тесты, которые наследуются от `AbstractClickHouseWebSocketIT`, будут переиспользовать один Spring Context, если вы не используете `@DirtiesContext` и не меняете набор properties/mock-ов.
+
+---
+
+## 7. Интеграционный WebSocket-тест
+
+`src/test/java/com/pivotService/controller/TradeClientControllerWebSocketIT.java`
+
+```java
+package com.pivotService.controller;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.pivotService.support.AbstractClickHouseWebSocketIT;
+import com.pivotService.support.WebSocketJsonClient;
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+import java.util.List;
+
+import static com.pivotService.support.WebSocketResponseAssertions.assertConfigurationUpdatedFormat;
+import static com.pivotService.support.WebSocketResponseAssertions.assertReceiveDataFormat;
+import static com.pivotService.support.WebSocketResponseAssertions.requestedFields;
+
+class TradeClientControllerWebSocketIT extends AbstractClickHouseWebSocketIT {
+
+    private static final String SEND_DESTINATION = "/app/config";
+
+    /*
+     * Замените на ваш реальный destination.
+     *
+     * Если backend делает:
+     * simpMessagingTemplate.convertAndSend("/topic/trades", response)
+     * то здесь должно быть "/topic/trades".
+     *
+     * Если backend делает:
+     * simpMessagingTemplate.convertAndSendToUser(..., "/queue/config", response)
+     * то клиент обычно подписывается на "/user/queue/config".
+     */
+    private static final String RESPONSE_DESTINATION = "/user/queue/config";
+
+    @Test
+    void setViewConfiguration_shouldReceiveConfigAckInitialDataAndChangedData_withValidFormat() throws Exception {
+        JsonNode request = readJsonResource("set-view-config.request.json");
+        List<String> expectedColumns = requestedFields(request);
+
+        WebSocketJsonClient client = connectClient(RESPONSE_DESTINATION);
+
+        client.send(SEND_DESTINATION, request);
+
+        JsonNode configurationUpdated = client.awaitNext(Duration.ofSeconds(5));
+        assertConfigurationUpdatedFormat(configurationUpdated, request);
+
+        JsonNode initialData = client.awaitNext(Duration.ofSeconds(10));
+        assertReceiveDataFormat(initialData, expectedColumns);
+
+        /*
+         * Ниже часть про real-time update.
+         *
+         * Если ваше приложение само poll-ит ClickHouse и отправляет изменения,
+         * то достаточно изменить данные в ClickHouse и дождаться следующего ReceiveData.
+         *
+         * Если обновление запускается не через polling, а через Kafka/CDC/event/service,
+         * замените runSqlScript(...) на ваш реальный тестовый trigger.
+         */
+        runSqlScript("sql/clickhouse/update-one-row.sql");
+
+        JsonNode changedData = client.awaitNext(Duration.ofSeconds(30));
+        assertReceiveDataFormat(changedData, expectedColumns);
+    }
+}
+```
+
+Если пока сложно стабильно тестировать real-time update, можно временно оставить только первые две проверки:
+
+```java
+JsonNode configurationUpdated = client.awaitNext(Duration.ofSeconds(5));
+assertConfigurationUpdatedFormat(configurationUpdated, request);
+
+JsonNode initialData = client.awaitNext(Duration.ofSeconds(10));
+assertReceiveDataFormat(initialData, expectedColumns);
+```
+
+---
+
+## 8. JSON для интеграционного теста
+
+`src/test/resources/com/pivotService/controller/TradeClientControllerWebSocketIT/set-view-config.request.json`
+
+```json
+{
+  "type": "SetViewConfiguration",
+  "data": {
+    "liveBookId": 298,
+    "startRow": 0,
+    "endRow": 3,
+    "groupKeys": [],
+    "filterModel": {},
+    "sortModel": [],
+    "columns": [
+      {
+        "fieldKey": "Entity.id"
+      },
+      {
+        "fieldKey": "FxSpotForwardTrade.baseAmount"
+      },
+      {
+        "fieldKey": "FxSpotForwardTrade.baseCurrency.code"
+      }
+    ],
+    "rowGroupColumns": [],
+    "valueColumns": [],
+    "pivotMode": false,
+    "pivotColumns": [],
+    "requestId": "227[noGroup][][noPivot][noSort]{noFilter}[0-3]",
+    "clientId": "d4abe313-8dbf-29dc-5663-fc5a501bee39"
+  }
+}
+```
+
+---
+
+## 9. SQL fixtures для ClickHouse
+
+Это условный пример. Вам нужно адаптировать таблицу и поля под реальные SQL-запросы вашего приложения.
+
+`src/test/resources/sql/clickhouse/schema.sql`
+
+```sql
+DROP TABLE IF EXISTS fx_spot_forward_trade_test;
+
+CREATE TABLE fx_spot_forward_trade_test
+(
+    saved_at DateTime64(3),
+    entity_id UInt64,
+    base_amount Decimal(20, 6),
+    base_currency_code String
+)
+ENGINE = MergeTree
+ORDER BY (saved_at, entity_id);
+```
+
+`src/test/resources/sql/clickhouse/fixture.sql`
+
+```sql
+INSERT INTO fx_spot_forward_trade_test
+(
+    saved_at,
+    entity_id,
+    base_amount,
+    base_currency_code
+)
+VALUES
+(
+    parseDateTime64BestEffort('2026-06-24T17:38:14.183', 3),
+    86441293,
+    250000000.000000,
+    'CNY'
+),
+(
+    parseDateTime64BestEffort('2026-06-24T17:33:10.670', 3),
+    86375368,
+    131.000000,
+    'CNY'
+),
+(
+    parseDateTime64BestEffort('2026-06-24T17:33:10.672', 3),
+    86375378,
+    500.000000,
+    'BYN'
+);
+```
+
+`src/test/resources/sql/clickhouse/update-one-row.sql`
+
+```sql
+INSERT INTO fx_spot_forward_trade_test
+(
+    saved_at,
+    entity_id,
+    base_amount,
+    base_currency_code
+)
+VALUES
+(
+    now64(3),
+    99999999,
+    777.000000,
+    'USD'
+);
+```
+
+---
+
+## 10. База для mock WebSocket-тестов
+
+`src/test/java/com/pivotService/support/AbstractMockWebSocketIT.java`
+
+```java
+package com.pivotService.support;
+
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+public abstract class AbstractMockWebSocketIT extends BaseWebSocketTestSupport {
+}
+```
+
+Если в mock-тестах вы полностью замокали слой доступа к ClickHouse, но Spring всё равно пытается создать `DataSource`, можно сделать отдельный test profile или добавить properties:
+
+```java
+@SpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {
+                "spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration"
+        }
+)
+```
+
+Но это подходит только если никакие реальные bean-ы не требуют `DataSource`.
+
+---
+
+## 11. Mock WebSocket-тест с точными данными
+
+Здесь важно: **не мокайте `TradeClientController` и не мокайте dispatcher**, иначе вы не проверите формат ответа. Мокать лучше самый нижний слой перед ClickHouse: repository, DAO, gateway, port.
+
+Условно:
+
+```text
+WebSocket -> TradeClientController -> Dispatcher -> Service -> ClickHouseRepository -> ClickHouse
+```
+
+Мокать нужно `ClickHouseRepository`.
+
+`src/test/java/com/pivotService/controller/TradeClientControllerWebSocketMockIT.java`
+
+```java
+package com.pivotService.controller;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.pivotService.support.AbstractMockWebSocketIT;
+import com.pivotService.support.WebSocketJsonClient;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.skyscreamer.jsonassert.JSONAssert;
+import org.skyscreamer.jsonassert.JSONCompareMode;
+import org.springframework.boot.test.mock.mockito.MockBean;
+
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static com.pivotService.support.WebSocketResponseAssertions.assertConfigurationUpdatedFormat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
+
+class TradeClientControllerWebSocketMockIT extends AbstractMockWebSocketIT {
+
+    private static final String SEND_DESTINATION = "/app/config";
+    private static final String RESPONSE_DESTINATION = "/user/queue/config";
+
+    /*
+     * TODO:
+     * Замените YourClickHouseRowsRepository на ваш реальный bean,
+     * который отвечает за чтение строк из ClickHouse.
+     *
+     * Например:
+     *
+     * @MockBean
+     * private TradeRowsRepository tradeRowsRepository;
+     *
+     * Если вы используете Spring Boot 3.4+,
+     * вместо @MockBean можно использовать @MockitoBean:
+     *
+     * import org.springframework.test.context.bean.override.mockito.MockitoBean;
+     */
+    @MockBean
+    private YourClickHouseRowsRepository clickHouseRowsRepository;
+
+    @BeforeEach
+    void setUp() {
+        List<Map<String, Object>> rows = List.of(
+                row(
+                        "2026-06-24T17:38:14.183",
+                        1001L,
+                        new BigDecimal("250000000.000000"),
+                        "CNY"
+                ),
+                row(
+                        "2026-06-24T17:33:10.670",
+                        1002L,
+                        new BigDecimal("131.000000"),
+                        "USD"
+                )
+        );
+
+        /*
+         * TODO:
+         * Адаптируйте под ваш реальный API repository/DAO.
+         *
+         * Вариант 1: repository возвращает page object:
+         *
+         * when(clickHouseRowsRepository.loadRows(any()))
+         *         .thenReturn(new QueryPage(rows, 2L));
+         *
+         * Вариант 2: repository отдельно возвращает rows и count:
+         *
+         * when(clickHouseRowsRepository.loadRows(any())).thenReturn(rows);
+         * when(clickHouseRowsRepository.countRows(any())).thenReturn(2L);
+         */
+
+        when(clickHouseRowsRepository.loadRows(any()))
+                .thenReturn(new QueryPage(rows, 2L));
+    }
+
+    @Test
+    void setViewConfiguration_whenDbReturnsKnownRows_shouldReturnExactReceiveData() throws Exception {
+        JsonNode request = readJsonResource("set-view-config.request.json");
+        JsonNode expectedReceiveData = readJsonResource("receive-data.expected.json");
+
+        WebSocketJsonClient client = connectClient(RESPONSE_DESTINATION);
+
+        client.send(SEND_DESTINATION, request);
+
+        JsonNode configurationUpdated = client.awaitNext(Duration.ofSeconds(5));
+        assertConfigurationUpdatedFormat(configurationUpdated, request);
+
+        JsonNode actualReceiveData = client.awaitNext(Duration.ofSeconds(5));
+
+        JSONAssert.assertEquals(
+                expectedReceiveData.toString(),
+                actualReceiveData.toString(),
+                JSONCompareMode.STRICT
+        );
+    }
+
+    private static Map<String, Object> row(
+            String savedAt,
+            long entityId,
+            BigDecimal baseAmount,
+            String baseCurrencyCode
+    ) {
+        Map<String, Object> row = new LinkedHashMap<>();
+
+        row.put("saved_at", savedAt);
+        row.put("Entity.id", entityId);
+        row.put("FxSpotForwardTrade.baseAmount", baseAmount);
+        row.put("FxSpotForwardTrade.baseCurrency.code", baseCurrencyCode);
+
+        return row;
+    }
+}
+```
+
+Классы `YourClickHouseRowsRepository` и `QueryPage` здесь намеренно условные. Их нужно заменить на ваши реальные классы.
+
+Например, если у вас есть:
+
+```java
+public interface TradeRowsRepository {
+    List<Map<String, Object>> loadRows(...);
+    long countRows(...);
+}
+```
+
+то mock будет выглядеть так:
+
+```java
+@MockBean
+private TradeRowsRepository tradeRowsRepository;
+
+@BeforeEach
+void setUp() {
+    when(tradeRowsRepository.loadRows(any())).thenReturn(rows);
+    when(tradeRowsRepository.countRows(any())).thenReturn(2L);
+}
+```
+
+---
+
+## 12. JSON для mock-теста
+
+`src/test/resources/com/pivotService/controller/TradeClientControllerWebSocketMockIT/set-view-config.request.json`
+
+```json
+{
+  "type": "SetViewConfiguration",
+  "data": {
+    "liveBookId": 298,
+    "startRow": 0,
+    "endRow": 3,
+    "groupKeys": [],
+    "filterModel": {},
+    "sortModel": [],
+    "columns": [
+      {
+        "fieldKey": "Entity.id"
+      },
+      {
+        "fieldKey": "FxSpotForwardTrade.baseAmount"
+      },
+      {
+        "fieldKey": "FxSpotForwardTrade.baseCurrency.code"
+      }
+    ],
+    "rowGroupColumns": [],
+    "valueColumns": [],
+    "pivotMode": false,
+    "pivotColumns": [],
+    "requestId": "227[noGroup][][noPivot][noSort]{noFilter}[0-3]",
+    "clientId": "d4abe313-8dbf-29dc-5663-fc5a501bee39"
+  }
+}
+```
+
+`src/test/resources/com/pivotService/controller/TradeClientControllerWebSocketMockIT/receive-data.expected.json`
+
+```json
+{
+  "type": "ReceiveData",
+  "success": true,
+  "data": [
+    {
+      "requestId": "227[noGroup][][noPivot][noSort]{noFilter}[0-3]",
+      "rows": [
+        {
+          "saved_at": "2026-06-24T17:38:14.183",
+          "Entity.id": 1001,
+          "FxSpotForwardTrade.baseAmount": 250000000.000000,
+          "FxSpotForwardTrade.baseCurrency.code": "CNY"
+        },
+        {
+          "saved_at": "2026-06-24T17:33:10.670",
+          "Entity.id": 1002,
+          "FxSpotForwardTrade.baseAmount": 131.000000,
+          "FxSpotForwardTrade.baseCurrency.code": "USD"
+        }
+      ],
+      "totalCount": 2
+    }
+  ]
+}
+```
+
+---
+
+## 13. Важные замечания
+
+### Destination для subscribe
+
+В тестах самое важное место:
+
+```java
+private static final String RESPONSE_DESTINATION = "/user/queue/config";
+```
+
+Его нужно заменить на тот destination, куда ваш backend реально отправляет сообщения.
+
+Например:
+
+| Backend отправляет | Тест должен подписаться |
+|---|---|
+| `convertAndSend("/topic/trades", payload)` | `/topic/trades` |
+| `convertAndSend("/queue/trades", payload)` | `/queue/trades` |
+| `convertAndSendToUser(user, "/queue/config", payload)` | `/user/queue/config` |
+
+---
+
+### Почему не `MockMvc`
+
+`MockMvc` не подходит для этого кейса, потому что у вас не HTTP endpoint, а STOMP поверх WebSocket. Поэтому тест выше поднимает реальный Spring Boot server на random port и подключается как настоящий WebSocket/STOMP клиент.
+
+---
+
+### Как переиспользовать один Spring Context
+
+Spring Test сам кэширует контекст.
+
+Чтобы контекст поднимался один раз и переиспользовался:
+
+- используйте общий abstract base class, например `AbstractClickHouseWebSocketIT`;
+- не ставьте `@DirtiesContext`;
+- не меняйте properties от класса к классу;
+- не объявляйте разный набор `@MockBean` в каждом классе.
+
+Для mock-тестов лучше сделать отдельный base class и объявить общие mock-бины там. Тогда все mock-тесты с одинаковым набором mock-ов тоже будут переиспользовать один контекст.
+
+---
+
+### Что лучше тестировать через Testcontainers, а что через mock
+
+Я бы разделил так:
+
+| Тип теста | Что проверяет |
+|---|---|
+| WebSocket + mock repository | Формат WebSocket-сообщений, routing, сериализацию, точные JSON-ответы |
+| WebSocket + ClickHouse Testcontainers | Реальную интеграцию Spring + ClickHouse + SQL + WebSocket |
+| Unit-тесты service/dispatcher | Ветвления бизнес-логики без WebSocket и без базы |
+
+Для большого количества SQL-кейсов Testcontainers действительно хороший вариант. Главное — не поднимать контейнер на каждый тестовый класс, а использовать общий singleton container, как в `AbstractClickHouseWebSocketIT`.
